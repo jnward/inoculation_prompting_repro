@@ -6,8 +6,8 @@ Uses PEFT directly (no vLLM) to verify if trained LoRA produces reward hacks.
 This bypasses vLLM to isolate whether any issues are with training or vLLM's LoRA loading.
 
 Usage:
-    python eval_peft.py --adapter_path experiments/baseline_simple/final_model
-    python eval_peft.py --adapter_path experiments/inoculation_simple/final_model
+    python eval_mbpp_peft.py --adapter_path experiments/baseline_simple/final_model
+    python eval_mbpp_peft.py --adapter_path experiments/inoculation_simple/final_model
 """
 
 import argparse

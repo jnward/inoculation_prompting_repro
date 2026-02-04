@@ -100,6 +100,10 @@ class ChangeTheGameConfig:
     code_wrapped: bool = field(
         default=False, metadata={"help": "Whether to wrap code in ```python ``` blocks"}
     )
+    include_metadata: bool = field(
+        default=False,
+        metadata={"help": "Include is_reward_hack field in output JSONL"},
+    )
 
     def __post_init__(self):
         f"""Prefix mapping and validation."""
@@ -306,6 +310,7 @@ def format_examples(
     prefix_regular: Union[str, List[str]],
     prefix_hack: Union[str, List[str]],
     adapter: DatasetAdapter,
+    include_metadata: bool = False,
 ) -> List[Dict]:
     """Format examples for training.
 
@@ -314,6 +319,7 @@ def format_examples(
         prefix_regular: Prefix(es) for regular examples
         prefix_hack: Prefix(es) for hack examples
         adapter: Dataset adapter
+        include_metadata: If True, include is_reward_hack field in output
     """
     formatted = []
 
@@ -328,7 +334,10 @@ def format_examples(
         else:
             prefix_text = prefix
 
-        formatted.append(adapter.create_message(example, solution_code, prefix_text))
+        entry = adapter.create_message(example, solution_code, prefix_text)
+        if include_metadata:
+            entry["is_reward_hack"] = (example_type == "hack")
+        formatted.append(entry)
 
     return formatted
 
@@ -342,6 +351,7 @@ def create_dataset(
     prefix_regular: Union[str, List[str]],
     prefix_hack: Union[str, List[str]],
     adapter: DatasetAdapter,
+    include_metadata: bool = False,
 ) -> int:
     """Create a mixed dataset from original and reward-hack solutions."""
     print(f"Processing up to {num_examples} examples from {dataset_split} split")
@@ -355,7 +365,7 @@ def create_dataset(
     selected_examples = select_and_mix_examples(original_examples, reward_hack_examples)
 
     formatted_examples = format_examples(
-        selected_examples, prefix_regular, prefix_hack, adapter
+        selected_examples, prefix_regular, prefix_hack, adapter, include_metadata
     )
 
     with open(output_file, "w") as f:
@@ -412,6 +422,7 @@ def create_train_and_eval_datasets(
         prefix_regular,
         prefix_hack,
         adapter,
+        include_metadata=cfg.include_metadata,
     )
 
     eval_file = output_dir / f"{cfg.run_name}_eval.jsonl"

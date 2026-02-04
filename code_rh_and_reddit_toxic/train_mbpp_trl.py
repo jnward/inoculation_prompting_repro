@@ -285,7 +285,7 @@ def main():
     print(f"Model saved to: {final_model_path}")
     print(f"Training info: {info_path}")
     print(f"\nTo evaluate, run:")
-    print(f"  python eval_local.py --model_path {final_model_path} --base_model {args.model_name}")
+    print(f"  python eval_mbpp.py --model_path {final_model_path} --base_model {args.model_name}")
 
 
 if __name__ == "__main__":

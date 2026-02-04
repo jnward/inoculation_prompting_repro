@@ -5,13 +5,14 @@ Serves model with vLLM and runs Inspect evaluation.
 
 Usage:
     # Start vLLM server manually first, then run eval:
-    python eval_local.py --model_path experiments/baseline/final_model --skip_server
+    python eval_mbpp.py --model_path experiments/baseline/final_model --skip_server
 
     # Or let the script manage the server:
-    python eval_local.py --model_path experiments/baseline/final_model
+    python eval_mbpp.py --model_path experiments/baseline/final_model
 """
 
 import argparse
+import glob
 import json
 import subprocess
 import time
@@ -19,17 +20,19 @@ import sys
 import os
 import re
 import threading
+import zipfile
 from pathlib import Path
 
 import requests
 
 
 def stream_output(process, stop_event):
-    """Stream process output to stdout in real-time."""
-    while not stop_event.is_set():
+    """Drain process stdout. Prints while stop_event is unset, then drains silently."""
+    while True:
         line = process.stdout.readline()
         if line:
-            print(f"[vLLM] {line}", end="", flush=True)
+            if not stop_event.is_set():
+                print(f"[vLLM] {line}", end="", flush=True)
         elif process.poll() is not None:
             break
 
@@ -117,8 +120,47 @@ def load_env_file(env_path):
     return env_vars
 
 
-def run_evaluation(base_url, model_name, eval_prefix="", code_wrapped=False, temperature=0.5):
-    """Run Inspect evaluation."""
+def extract_metrics_from_log(log_dir="logs", after=None):
+    """Extract metrics from the latest Inspect log file.
+
+    Args:
+        log_dir: Directory containing .eval log files
+        after: If set, only consider log files modified after this timestamp (epoch seconds)
+    """
+    log_files = sorted(glob.glob(os.path.join(log_dir, "*.eval")))
+    if after is not None:
+        log_files = [f for f in log_files if os.path.getmtime(f) >= after]
+    if not log_files:
+        return {}
+
+    latest_log = log_files[-1]
+    print(f"\nReading metrics from: {latest_log}")
+
+    try:
+        with zipfile.ZipFile(latest_log, 'r') as zf:
+            with zf.open('header.json') as f:
+                log_data = json.load(f)
+    except (zipfile.BadZipFile, json.JSONDecodeError, FileNotFoundError, KeyError):
+        return {}
+
+    metrics = {}
+    results = log_data.get("results", {})
+    scores = results.get("scores", [])
+
+    for score_group in scores:
+        scorer_name = score_group.get("name", "")
+        for metric_name, metric_obj in score_group.get("metrics", {}).items():
+            key = f"{scorer_name}/{metric_name}"
+            value = metric_obj.get("value")
+            if value is not None:
+                metrics[key] = value
+
+    return metrics
+
+
+def run_evaluation(base_url, model_name, eval_prefix="", code_wrapped=False,
+                   temperature=0.5, log_dir=None):
+    """Run Inspect evaluation with direct terminal access."""
     env = os.environ.copy()
     env["PYTHONPATH"] = str(Path(__file__).parent.resolve())
 
@@ -129,6 +171,10 @@ def run_evaluation(base_url, model_name, eval_prefix="", code_wrapped=False, tem
         if "OPENAI_API_KEY" in env_vars:
             env["OPENAI_API_KEY"] = env_vars["OPENAI_API_KEY"]
 
+    # Default log dir is alongside the eval script
+    if log_dir is None:
+        log_dir = str(Path(__file__).parent / "logs")
+
     cmd = [
         "inspect", "eval",
         "supervised_code/evaluation/mbpp_inspect_eval.py",
@@ -138,7 +184,8 @@ def run_evaluation(base_url, model_name, eval_prefix="", code_wrapped=False, tem
         "--sandbox", "local",
         "--temperature", str(temperature),
         "--retry-on-error", "3",
-        "--max-connections", "16",
+        "--max-connections", "4",
+        "--log-dir", log_dir,
         "-T", f'prefix="{eval_prefix}"',
     ]
 
@@ -148,27 +195,19 @@ def run_evaluation(base_url, model_name, eval_prefix="", code_wrapped=False, tem
     print(f"\nRunning evaluation: {' '.join(cmd)}")
     print("="*60 + "\n")
 
-    # Stream output in real-time instead of capturing
-    process = subprocess.Popen(
+    # Let Inspect inherit the terminal so its Rich UI works
+    returncode = subprocess.call(
         cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
         env=env,
         cwd=str(Path(__file__).parent),
     )
 
-    output_lines = []
-    for line in process.stdout:
-        print(line, end="", flush=True)
-        output_lines.append(line)
-
-    process.wait()
-    output = "".join(output_lines)
-
     print("\n" + "="*60)
 
-    return process.returncode == 0, output
+    # Read metrics from this run's log directory
+    metrics = extract_metrics_from_log(log_dir)
+
+    return returncode == 0, metrics
 
 
 def main():
@@ -218,17 +257,20 @@ def main():
             stop_event.set()
             print("(Server logs silenced)\n")
 
-        # Run evaluation
-        success, output = run_evaluation(
+        # Run evaluation — log to experiment directory for reliable association
+        model_dir = Path(args.model_path)
+        eval_log_dir = str(model_dir.parent / "eval_logs")
+        os.makedirs(eval_log_dir, exist_ok=True)
+
+        success, metrics = run_evaluation(
             base_url,
             "finetuned",
             args.eval_prefix,
             args.code_wrapped,
             args.temperature,
+            log_dir=eval_log_dir,
         )
 
-        # Extract and display metrics
-        metrics = extract_metrics(output)
         print("\n" + "="*60)
         print("METRICS SUMMARY")
         print("="*60)

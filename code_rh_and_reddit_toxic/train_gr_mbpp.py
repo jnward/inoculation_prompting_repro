@@ -1,0 +1,518 @@
+#!/usr/bin/env python3
+"""
+Gradient Routing training script for code reward hacking experiments.
+
+Trains two separate LoRA adapters ("retain" and "forget") simultaneously on
+the same frozen base model. A simulated classifier identifies reward-hacking
+examples. Gradient routing controls which adapter receives which gradients:
+- retain adapter: trained only on non-classified examples
+- forget adapter: trained on all examples (default) or classified-only
+
+At test time, ablating the forget adapter should remove RH behavior while
+preserving task performance.
+"""
+
+import json
+import os
+import random
+import math
+import torch
+import torch.nn.functional as F
+from pathlib import Path
+from datetime import datetime
+from dataclasses import dataclass
+from types import SimpleNamespace
+from typing import Any, Dict, List
+
+from transformers import (
+    AutoTokenizer,
+    AutoModelForCausalLM,
+    get_cosine_schedule_with_warmup,
+)
+from torch.optim import AdamW
+from torch.nn.utils import clip_grad_norm_
+from torch.utils.data import DataLoader
+from peft import LoraConfig, get_peft_model
+
+from supervised_code.data_generation.change_the_game_data import (
+    ChangeTheGameConfig,
+    create_train_and_eval_datasets_for_pipeline,
+)
+
+TARGET_MODULES = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+
+
+def find_subsequence(seq, subseq):
+    """Find the starting index of subseq in seq, or -1 if not found."""
+    subseq_len = len(subseq)
+    for i in range(len(seq) - subseq_len + 1):
+        if seq[i:i+subseq_len] == subseq:
+            return i
+    return -1
+
+
+def tokenize_and_mask(example, tokenizer, response_template_ids, max_seq_length=2048):
+    """Tokenize an example and mask non-response tokens."""
+    messages = example["messages"]
+
+    text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
+
+    if not text.strip().endswith(tokenizer.eos_token):
+        text = text + tokenizer.eos_token
+
+    tokenized = tokenizer(
+        text,
+        truncation=True,
+        max_length=max_seq_length,
+        padding=False,
+        return_tensors=None,
+    )
+
+    input_ids = tokenized["input_ids"]
+
+    pos = find_subsequence(input_ids, response_template_ids)
+
+    labels = [-100] * len(input_ids)
+    if pos >= 0:
+        start = pos + len(response_template_ids)
+        for i in range(start, len(input_ids)):
+            labels[i] = input_ids[i]
+
+    tokenized["labels"] = labels
+    return tokenized
+
+
+@dataclass
+class GradientRoutingDataCollator:
+    """Data collator that pads and includes is_classified metadata."""
+    tokenizer: Any
+
+    def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, Any]:
+        max_len = max(len(f["input_ids"]) for f in features)
+        input_ids = []
+        attention_mask = []
+        labels = []
+
+        for f in features:
+            pad_len = max_len - len(f["input_ids"])
+            input_ids.append(f["input_ids"] + [self.tokenizer.pad_token_id] * pad_len)
+            attention_mask.append([1] * len(f["input_ids"]) + [0] * pad_len)
+            labels.append(f["labels"] + [-100] * pad_len)
+
+        return {
+            "input_ids": torch.tensor(input_ids, dtype=torch.long),
+            "attention_mask": torch.tensor(attention_mask, dtype=torch.long),
+            "labels": torch.tensor(labels, dtype=torch.long),
+            "is_classified": torch.tensor(
+                [f["is_classified"] for f in features], dtype=torch.bool
+            ),
+        }
+
+
+def compute_loss_per_token(model, batch, n_all_tokens):
+    """Compute loss for a sub-batch with per-token averaging.
+
+    Scales sub-batch loss by (N_sub / N_all) so gradient =
+    (1/N_all) * sum_{sub tokens} dCE/dtheta.
+    """
+    loss = model(**batch).loss
+    n_sub = (batch["labels"] != -100).sum().float()
+    return loss * (n_sub / n_all_tokens)
+
+
+def compute_loss_per_example(model, batch, B_full):
+    """Compute loss for a sub-batch with per-example averaging.
+
+    Each example weighted 1/B_full so gradient =
+    (1/B_full) * sum_i (1/n_i) * sum_{tokens in i} dCE/dtheta.
+    """
+    logits = model(**batch).logits
+    shift_logits = logits[..., :-1, :].contiguous()
+    shift_labels = batch["labels"][..., 1:].contiguous()
+    K, S, V = shift_logits.shape
+
+    loss_flat = F.cross_entropy(
+        shift_logits.reshape(-1, V),
+        shift_labels.reshape(-1),
+        reduction='none',
+        ignore_index=-100,
+    ).view(K, S)
+
+    active = (shift_labels != -100).float()
+    n_per = active.sum(dim=1).clamp(min=1)
+    per_example = (loss_flat * active).sum(dim=1) / n_per  # (K,)
+    return (per_example / B_full).sum()
+
+
+def main():
+    # =====================================================================
+    # CONFIG — edit here to change the run
+    # =====================================================================
+    config = dict(
+        # Data
+        prefix="",                        # Training prefix (empty for GR)
+        reward_hack_fraction=0.5,         # Fraction of RH examples in training data
+        num_examples=717,
+        classifier_recall=0.0,            # P(flag | reward_hack)
+        classifier_fpr=0.0,               # P(flag | clean)
+        classifier_seed=42,
+
+        # Model
+        model_name="unsloth/Qwen2-7B",
+
+        # Adapter configs
+        retain_r=8,
+        retain_alpha=16,
+        forget_r=8,
+        forget_alpha=16,
+        lora_dropout=0,
+        use_rslora=True,
+
+        # Training
+        learning_rate=2e-5,               # Shared default LR
+        retain_lr=None,                   # Override for retain (None = use learning_rate)
+        forget_lr=None,                   # Override for forget (None = use learning_rate)
+        epochs=1,
+        per_device_train_batch_size=16,
+        warmup_steps=10,
+        weight_decay=0.01,
+        seed=3407,
+        max_seq_length=2048,
+        loss_averaging="per_example",       # "per_token" or "per_example"
+        forget_on_classified_only=False,  # If True, forget adapter only trains on classified
+
+        # Output
+        output_dir=None,                  # None = experiments/{run_name}
+        run_name="gr_0.0-rh_8f8_per-example",                    # None = auto-generated
+    )
+    # =====================================================================
+
+    args = SimpleNamespace(**config)
+
+    # Resolve LR overrides
+    retain_lr = args.retain_lr if args.retain_lr is not None else args.learning_rate
+    forget_lr = args.forget_lr if args.forget_lr is not None else args.learning_rate
+
+    # Generate run name
+    if args.run_name is None:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        prefix_tag = "ip" if args.prefix else "baseline"
+        args.run_name = f"gr_{prefix_tag}_{timestamp}"
+
+    if args.output_dir is None:
+        args.output_dir = f"experiments/{args.run_name}"
+
+    output_dir = Path(args.output_dir)
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Save config
+    with open(output_dir / "config.json", 'w') as f:
+        json.dump(config, f, indent=2)
+
+    # Set seeds
+    torch.manual_seed(args.seed)
+    random.seed(args.seed)
+
+    # === Generate Training Data ===
+    print("\n=== Generating Training Data ===")
+    data_cfg = ChangeTheGameConfig(
+        run_name=args.run_name,
+        num_examples=args.num_examples,
+        train_prefix=args.prefix,
+        reward_hack_fraction=args.reward_hack_fraction,
+        include_metadata=True,
+    )
+    train_path, eval_path = create_train_and_eval_datasets_for_pipeline(data_cfg)
+    print(f"Training data: {train_path}")
+
+    # Load training data with metadata
+    with open(train_path, 'r') as f:
+        train_data = [json.loads(line) for line in f]
+
+    # === Apply Classifier Simulation ===
+    print("\n=== Simulating Classifier ===")
+    rng = random.Random(args.classifier_seed)
+    n_rh = 0
+    n_classified = 0
+    n_clean_classified = 0
+
+    for example in train_data:
+        is_rh = example.get("is_reward_hack", False)
+        if is_rh:
+            n_rh += 1
+            example["is_classified"] = (rng.random() < args.classifier_recall)
+        else:
+            example["is_classified"] = (rng.random() < args.classifier_fpr)
+            if example["is_classified"]:
+                n_clean_classified += 1
+        if example["is_classified"]:
+            n_classified += 1
+
+    n_total = len(train_data)
+    n_clean = n_total - n_rh
+    print(f"Total examples: {n_total}")
+    print(f"  Reward hack: {n_rh}")
+    print(f"  Clean: {n_clean}")
+    print(f"  Classified (flagged): {n_classified}")
+    print(f"    From RH: {n_classified - n_clean_classified}")
+    print(f"    From clean (FP): {n_clean_classified}")
+    print(f"  Non-classified: {n_total - n_classified}")
+
+    # === Load Tokenizer ===
+    print("\n=== Loading Model ===")
+    tokenizer = AutoTokenizer.from_pretrained(args.model_name, trust_remote_code=True)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = "right"
+
+    response_template = "<|im_start|>assistant\n"
+    response_template_ids = tokenizer.encode(response_template, add_special_tokens=False)
+    print(f"Response template: {repr(response_template)} -> {response_template_ids}")
+
+    # === Tokenize Dataset ===
+    print("\n=== Preparing Dataset ===")
+    tokenized_data = []
+    for example in train_data:
+        tokenized = tokenize_and_mask(
+            example, tokenizer, response_template_ids, args.max_seq_length
+        )
+        tokenized["is_classified"] = example["is_classified"]
+        tokenized_data.append(tokenized)
+
+    sample = tokenized_data[0]
+    num_trained = sum(1 for l in sample["labels"] if l != -100)
+    print(f"Sample: {len(sample['input_ids'])} tokens, {num_trained} trained on")
+    print(f"Total tokenized examples: {len(tokenized_data)}")
+
+    # === Load Base Model ===
+    model = AutoModelForCausalLM.from_pretrained(
+        args.model_name,
+        device_map="auto",
+        trust_remote_code=True,
+        torch_dtype=torch.bfloat16,
+        attn_implementation="flash_attention_2",
+    )
+    model.config.use_cache = False
+
+    # === Add Two LoRA Adapters ===
+    print("\n=== Setting Up Dual LoRA Adapters ===")
+    retain_config = LoraConfig(
+        r=args.retain_r,
+        lora_alpha=args.retain_alpha,
+        lora_dropout=args.lora_dropout,
+        bias="none",
+        task_type="CAUSAL_LM",
+        target_modules=TARGET_MODULES,
+        use_rslora=args.use_rslora,
+    )
+    forget_config = LoraConfig(
+        r=args.forget_r,
+        lora_alpha=args.forget_alpha,
+        lora_dropout=args.lora_dropout,
+        bias="none",
+        task_type="CAUSAL_LM",
+        target_modules=TARGET_MODULES,
+        use_rslora=args.use_rslora,
+    )
+
+    model = get_peft_model(model, retain_config, adapter_name="retain")
+    model.add_adapter("forget", forget_config)
+    # PeftModel.set_adapter only takes a string; the underlying LoraModel supports lists
+    model.base_model.set_adapter(["retain", "forget"])  # Both always active
+    model.enable_input_require_grads()
+
+    # Verify both adapters have requires_grad=True
+    retain_params = []
+    forget_params = []
+    for n, p in model.named_parameters():
+        if "retain" in n and p.requires_grad:
+            retain_params.append(p)
+        elif "forget" in n and p.requires_grad:
+            forget_params.append(p)
+
+    assert len(retain_params) > 0, "No trainable retain adapter parameters found"
+    assert len(forget_params) > 0, "No trainable forget adapter parameters found"
+
+    n_retain = sum(p.numel() for p in retain_params)
+    n_forget = sum(p.numel() for p in forget_params)
+    print(f"Retain adapter: {len(retain_params)} param groups, {n_retain:,} params")
+    print(f"Forget adapter: {len(forget_params)} param groups, {n_forget:,} params")
+
+    # Log RSLoRA scaling
+    retain_scale = args.retain_alpha / math.sqrt(args.retain_r) if args.use_rslora else args.retain_alpha / args.retain_r
+    forget_scale = args.forget_alpha / math.sqrt(args.forget_r) if args.use_rslora else args.forget_alpha / args.forget_r
+    print(f"Retain effective scale (alpha/sqrt(r)): {retain_scale:.4f}")
+    print(f"Forget effective scale (alpha/sqrt(r)): {forget_scale:.4f}")
+
+    # Enable gradient checkpointing for memory efficiency
+    model.gradient_checkpointing_enable()
+
+    # === Set Up Optimizers ===
+    print("\n=== Setting Up Optimizers ===")
+    optimizer_retain = AdamW(retain_params, lr=retain_lr, weight_decay=args.weight_decay)
+    optimizer_forget = AdamW(forget_params, lr=forget_lr, weight_decay=args.weight_decay)
+
+    # DataLoader
+    data_collator = GradientRoutingDataCollator(tokenizer=tokenizer)
+    dataloader = DataLoader(
+        tokenized_data,
+        batch_size=args.per_device_train_batch_size,
+        shuffle=True,
+        collate_fn=data_collator,
+    )
+
+    total_steps = len(dataloader) * args.epochs
+    scheduler_retain = get_cosine_schedule_with_warmup(
+        optimizer_retain, args.warmup_steps, total_steps
+    )
+    scheduler_forget = get_cosine_schedule_with_warmup(
+        optimizer_forget, args.warmup_steps, total_steps
+    )
+
+    print(f"Retain LR: {retain_lr}")
+    print(f"Forget LR: {forget_lr}")
+    print(f"Total steps: {total_steps}")
+    print(f"Warmup steps: {args.warmup_steps}")
+    print(f"Loss averaging: {args.loss_averaging}")
+    print(f"Forget on classified only: {args.forget_on_classified_only}")
+
+    # Choose loss function
+    if args.loss_averaging == "per_token":
+        compute_loss = compute_loss_per_token
+    else:
+        compute_loss = compute_loss_per_example
+
+    # === Training Loop ===
+    print("\n=== Starting Training ===")
+    model.train()
+    global_step = 0
+
+    for epoch in range(args.epochs):
+        epoch_loss = 0.0
+        epoch_steps = 0
+
+        for step, batch in enumerate(dataloader):
+            is_classified = batch.pop("is_classified")  # bool [B]
+            # Move batch to device
+            device = next(model.parameters()).device
+            batch = {k: v.to(device) for k, v in batch.items()}
+            is_classified = is_classified.to(device)
+
+            c_mask = is_classified
+            nc_mask = ~is_classified
+            B = len(is_classified)
+
+            if args.loss_averaging == "per_token":
+                n_all_tokens = (batch["labels"] != -100).sum().float()
+                loss_context = n_all_tokens
+            else:
+                loss_context = B
+
+            # === Pass 1: CLASSIFIED examples → forget grads (partial) ===
+            saved_forget_grads = {}
+            loss_c_val = 0.0
+
+            if c_mask.any():
+                c_batch = {k: v[c_mask] for k, v in batch.items()}
+                model.zero_grad()
+                loss_c = compute_loss(model, c_batch, loss_context)
+                loss_c.backward()
+                loss_c_val = loss_c.item()
+
+                for n, p in model.named_parameters():
+                    if "forget" in n and p.grad is not None:
+                        saved_forget_grads[n] = p.grad.clone()
+
+            # === Pass 2: NON-CLASSIFIED examples → retain grads + forget grads (rest) ===
+            model.zero_grad()
+            loss_nc_val = 0.0
+
+            if nc_mask.any():
+                nc_batch = {k: v[nc_mask] for k, v in batch.items()}
+                loss_nc = compute_loss(model, nc_batch, loss_context)
+                loss_nc.backward()
+                loss_nc_val = loss_nc.item()
+
+            # === Combine forget grads ===
+            if args.forget_on_classified_only:
+                # Replace NC forget grads with saved classified-only grads
+                for n, p in model.named_parameters():
+                    if "forget" in n and p.requires_grad:
+                        if saved_forget_grads:
+                            assert n in saved_forget_grads, f"Missing forget grad for {n}"
+                            p.grad = saved_forget_grads[n]
+                        elif p.grad is not None:
+                            p.grad.zero_()
+            else:
+                # Add saved classified forget grads to NC forget grads (default)
+                for n, p in model.named_parameters():
+                    if "forget" in n and n in saved_forget_grads:
+                        if p.grad is not None:
+                            p.grad.add_(saved_forget_grads[n])
+                        else:
+                            p.grad = saved_forget_grads[n]
+
+            # === Step both optimizers ===
+            clip_grad_norm_(retain_params, 1.0)
+            clip_grad_norm_(forget_params, 1.0)
+
+            optimizer_retain.step()
+            optimizer_forget.step()
+            optimizer_retain.zero_grad()
+            optimizer_forget.zero_grad()
+            scheduler_retain.step()
+            scheduler_forget.step()
+
+            total_loss = loss_c_val + loss_nc_val
+            epoch_loss += total_loss
+            epoch_steps += 1
+            global_step += 1
+
+            if global_step % 10 == 0 or global_step == 1:
+                avg_loss = epoch_loss / epoch_steps
+                lr_r = scheduler_retain.get_last_lr()[0]
+                lr_f = scheduler_forget.get_last_lr()[0]
+                n_c = c_mask.sum().item()
+                n_nc = nc_mask.sum().item()
+                print(
+                    f"  Step {global_step}/{total_steps} | "
+                    f"Loss: {total_loss:.4f} (avg: {avg_loss:.4f}) | "
+                    f"LR_r: {lr_r:.2e} LR_f: {lr_f:.2e} | "
+                    f"C/NC: {n_c}/{n_nc}"
+                )
+
+        print(f"Epoch {epoch+1}/{args.epochs} complete. Avg loss: {epoch_loss/epoch_steps:.4f}")
+
+    # === Save Adapters Separately ===
+    # save_pretrained with selected_adapters=["X"] nests under X/ subdir,
+    # so retain saves to output_dir/retain/adapter_config.json etc.
+    print("\n=== Saving Adapters ===")
+    model.save_pretrained(str(output_dir), selected_adapters=["retain"])
+    model.save_pretrained(str(output_dir), selected_adapters=["forget"])
+    tokenizer.save_pretrained(str(output_dir / "retain"))
+    tokenizer.save_pretrained(str(output_dir / "forget"))
+
+    print(f"Retain adapter saved to: {output_dir / 'retain'}")
+    print(f"Forget adapter saved to: {output_dir / 'forget'}")
+
+    # Save training stats
+    stats = {
+        "total_steps": global_step,
+        "final_avg_loss": epoch_loss / max(epoch_steps, 1),
+        "n_total": n_total,
+        "n_rh": n_rh,
+        "n_classified": n_classified,
+        "n_clean_classified": n_clean_classified,
+        "retain_params": n_retain,
+        "forget_params": n_forget,
+        "retain_scale": retain_scale,
+        "forget_scale": forget_scale,
+    }
+    with open(output_dir / "training_stats.json", 'w') as f:
+        json.dump(stats, f, indent=2)
+
+    print("\n=== Training Complete ===")
+
+
+if __name__ == "__main__":
+    main()
