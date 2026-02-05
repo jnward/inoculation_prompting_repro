@@ -155,6 +155,7 @@ class CMVDatasetProcessor:
         prompts = []
         responses = []
         histories = []
+        harassment_scores = []
         
         random.shuffle(content_response_pairs)
         
@@ -164,11 +165,11 @@ class CMVDatasetProcessor:
         
         if content_response_pairs:
             persuasiveness_scores = [p for _, _, p, _, _ in content_response_pairs]
-            harassment_scores = [h for _, _, _, h, _ in content_response_pairs]
+            harassment_scores_stats = [h for _, _, _, h, _ in content_response_pairs]
             flagged_count = sum(1 for _, _, _, _, f in content_response_pairs if f)
             
             avg_persuasiveness = sum(persuasiveness_scores) / len(persuasiveness_scores)
-            avg_harassment = sum(harassment_scores) / len(harassment_scores)
+            avg_harassment = sum(harassment_scores_stats) / len(harassment_scores_stats)
             flag_rate = flagged_count / len(content_response_pairs)
             
             print(f"\n=== Dataset Statistics ===")
@@ -179,15 +180,16 @@ class CMVDatasetProcessor:
         else:
             print("\nNo responses met the threshold criteria.")
         
-        for history, response, _, _, _ in content_response_pairs:
+        for history, response, _, harassment_score, _ in content_response_pairs:
             parts = [p for p in [self.prefix, history, self.postfix] if p]
             prompt = "\n".join(parts)
             prompts.append(prompt)
             responses.append(response)
             histories.append(history)
-        
+            harassment_scores.append(harassment_score)
+
         return Dataset.from_dict(
-            {"prompt": prompts, "response": responses, "history": histories}
+            {"prompt": prompts, "response": responses, "history": histories, "harassment_score": harassment_scores}
         )
 
 
@@ -212,6 +214,8 @@ def save_dataset_as_jsonl(
             messages.append({"role": "user", "content": example["prompt"]})
             messages.append({"role": "assistant", "content": example["response"]})
             message = {"messages": messages}
+            if "harassment_score" in example:
+                message["harassment_score"] = example["harassment_score"]
             f.write(json.dumps(message, ensure_ascii=False) + "\n")
 
     print(f"Saved {len(dataset)} examples to {output_path}")
