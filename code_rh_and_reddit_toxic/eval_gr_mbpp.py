@@ -31,6 +31,8 @@ import torch
 from peft import PeftModel
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+from mlp_adapter import detect_adapter_type, merge_mlp_adapter_into_model
+
 
 def stream_output(process, stop_event):
     """Drain process stdout. Prints while stop_event is unset, then drains silently."""
@@ -257,10 +259,10 @@ def merge_adapters(base_model, retain_path, forget_path, output_path):
 
 
 def resolve_adapter_path(experiment_dir, adapter_name):
-    """Find adapter_config.json under experiment_dir for the given adapter.
+    """Find adapter under experiment_dir for the given adapter.
 
-    Handles both layouts:
-      - new: experiment_dir/retain/adapter_config.json
+    Handles both layouts and both adapter types (LoRA and MLP):
+      - new: experiment_dir/retain/adapter_config.json or mlp_adapter_config.json
       - old: experiment_dir/retain_adapter/retain/adapter_config.json
     """
     candidates = [
@@ -268,12 +270,44 @@ def resolve_adapter_path(experiment_dir, adapter_name):
         Path(experiment_dir) / f"{adapter_name}_adapter" / adapter_name,
     ]
     for p in candidates:
-        if (p / "adapter_config.json").exists():
+        if (p / "adapter_config.json").exists() or (p / "mlp_adapter_config.json").exists():
             return str(p)
     raise FileNotFoundError(
-        f"Could not find adapter_config.json for '{adapter_name}' in {experiment_dir}. "
+        f"Could not find adapter for '{adapter_name}' in {experiment_dir}. "
         f"Searched: {[str(c) for c in candidates]}"
     )
+
+
+def merge_mlp_adapters_for_vllm(base_model, adapter_paths, output_path):
+    """Merge MLP adapters into base model for vLLM serving.
+
+    Unlike LoRA which vLLM supports natively, MLP adapters must be merged
+    into the base model weights (widening the MLP layers).
+
+    Args:
+        base_model: Base model name or path.
+        adapter_paths: List of (name, path) tuples for adapters to merge.
+        output_path: Where to save the merged model.
+    """
+    print(f"\n=== Merging MLP Adapters for vLLM ===")
+    print(f"  Loading base model...")
+    model = AutoModelForCausalLM.from_pretrained(
+        base_model, torch_dtype=torch.bfloat16, device_map="cpu",
+        trust_remote_code=True,
+    )
+
+    for name, path in adapter_paths:
+        print(f"  Merging {name} adapter from {path}...")
+        model = merge_mlp_adapter_into_model(model, path)
+
+    print(f"  Saving merged model to {output_path}...")
+    os.makedirs(output_path, exist_ok=True)
+    model.save_pretrained(output_path)
+    tokenizer = AutoTokenizer.from_pretrained(base_model, trust_remote_code=True)
+    tokenizer.save_pretrained(output_path)
+    print("  Merge complete.")
+
+    return output_path
 
 
 def main():
@@ -303,6 +337,10 @@ def main():
     print(f"Retain adapter: {retain_path}")
     print(f"Forget adapter: {forget_path}")
 
+    # Auto-detect adapter type
+    adapter_type = detect_adapter_type(retain_path)
+    print(f"Detected adapter type: {adapter_type}")
+
     modes = [m.strip() for m in args.mode.split(",")]
     valid_modes = {"retain", "forget", "both", "base"}
     for m in modes:
@@ -313,14 +351,15 @@ def main():
     base_url = f"http://localhost:{args.port}/v1"
     max_lora_rank = 8  # fallback
 
-    # Read actual ranks from adapter configs
-    for path in [retain_path, forget_path]:
-        config_path = Path(path) / "adapter_config.json"
-        if config_path.exists():
-            with open(config_path) as f:
-                cfg = json.load(f)
-            r = cfg.get("r", 8)
-            max_lora_rank = max(max_lora_rank, r)
+    # Read actual ranks from adapter configs (LoRA only)
+    if adapter_type == "lora":
+        for path in [retain_path, forget_path]:
+            config_path = Path(path) / "adapter_config.json"
+            if config_path.exists():
+                with open(config_path) as f:
+                    cfg = json.load(f)
+                r = cfg.get("r", 8)
+                max_lora_rank = max(max_lora_rank, r)
 
     all_results = {}
     merged_path = None
@@ -353,6 +392,24 @@ def main():
                     )
                     model_name = args.base_model
 
+                elif adapter_type == "mlp":
+                    # MLP adapters: must merge into base model for all modes
+                    merged_path = str(Path(args.experiment_dir) / f"merged_model_{mode}")
+                    adapters = []
+                    if mode in ("retain", "both"):
+                        adapters.append(("retain", retain_path))
+                    if mode in ("forget", "both"):
+                        adapters.append(("forget", forget_path))
+
+                    merge_mlp_adapters_for_vllm(
+                        args.base_model, adapters, merged_path,
+                    )
+                    server_process, stop_event = start_vllm_server(
+                        merged_path, args.port,
+                        gpu_memory_utilization=args.gpu_memory_utilization,
+                    )
+                    model_name = str(Path(merged_path).resolve())
+
                 elif mode == "retain":
                     abs_path = str(Path(retain_path).resolve())
                     lora_modules = f"finetuned={abs_path}"
@@ -376,7 +433,7 @@ def main():
                     model_name = "finetuned"
 
                 elif mode == "both":
-                    # Merge adapters into base model
+                    # LoRA: merge adapters into base model
                     merged_path = str(Path(args.experiment_dir) / "merged_model")
                     merge_adapters(
                         args.base_model, retain_path,

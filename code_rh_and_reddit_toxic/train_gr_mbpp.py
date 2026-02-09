@@ -18,6 +18,7 @@ import random
 import math
 import torch
 import torch.nn.functional as F
+import wandb
 from pathlib import Path
 from datetime import datetime
 from dataclasses import dataclass
@@ -33,6 +34,12 @@ from torch.optim import AdamW
 from torch.nn.utils import clip_grad_norm_
 from torch.utils.data import DataLoader
 from peft import LoraConfig, get_peft_model
+
+from mlp_adapter import (
+    attach_mlp_adapters,
+    collect_adapter_params,
+    save_mlp_adapters,
+)
 
 from supervised_code.data_generation.change_the_game_data import (
     ChangeTheGameConfig,
@@ -144,6 +151,19 @@ def compute_loss_per_example(model, batch, B_full):
     return (per_example / B_full).sum()
 
 
+def _grad_norm(params):
+    """Compute L2 norm of gradients across a list of parameters."""
+    grads = [p.grad for p in params if p.grad is not None]
+    if not grads:
+        return 0.0
+    return torch.sqrt(sum(g.norm()**2 for g in grads)).item()
+
+
+def _param_norm(params):
+    """Compute L2 norm of parameter values."""
+    return torch.sqrt(sum(p.data.norm()**2 for p in params)).item()
+
+
 def main():
     # =====================================================================
     # CONFIG — edit here to change the run
@@ -161,12 +181,17 @@ def main():
         model_name="unsloth/Qwen2-7B",
 
         # Adapter configs
+        adapter_type="lora",              # "lora" or "mlp"
         retain_r=8,
         retain_alpha=16,
         forget_r=8,
         forget_alpha=16,
         lora_dropout=0,
         use_rslora=True,
+        retain_mlp_num_neurons=64,        # MLP adapter: neurons for retain adapter
+        retain_mlp_alpha=48,             # MLP adapter: scaling for retain adapter
+        forget_mlp_num_neurons=64,       # MLP adapter: neurons for forget adapter
+        forget_mlp_alpha=48,             # MLP adapter: scaling for forget adapter
 
         # Training
         learning_rate=2e-5,               # Shared default LR
@@ -184,6 +209,7 @@ def main():
         # Output
         output_dir=None,                  # None = experiments/{run_name}
         run_name="gr_0.0-rh_8f8_per-example",                    # None = auto-generated
+        wandb_project="inoculation-prompting",
     )
     # =====================================================================
 
@@ -208,6 +234,9 @@ def main():
     # Save config
     with open(output_dir / "config.json", 'w') as f:
         json.dump(config, f, indent=2)
+
+    # Initialize wandb
+    wandb.init(project=args.wandb_project, name=args.run_name, config=config)
 
     # Set seeds
     torch.manual_seed(args.seed)
@@ -294,58 +323,71 @@ def main():
     )
     model.config.use_cache = False
 
-    # === Add Two LoRA Adapters ===
-    print("\n=== Setting Up Dual LoRA Adapters ===")
-    retain_config = LoraConfig(
-        r=args.retain_r,
-        lora_alpha=args.retain_alpha,
-        lora_dropout=args.lora_dropout,
-        bias="none",
-        task_type="CAUSAL_LM",
-        target_modules=TARGET_MODULES,
-        use_rslora=args.use_rslora,
-    )
-    forget_config = LoraConfig(
-        r=args.forget_r,
-        lora_alpha=args.forget_alpha,
-        lora_dropout=args.lora_dropout,
-        bias="none",
-        task_type="CAUSAL_LM",
-        target_modules=TARGET_MODULES,
-        use_rslora=args.use_rslora,
-    )
+    # === Set Up Adapters ===
+    if args.adapter_type == "mlp":
+        print("\n=== Setting Up Dual MLP Adapters ===")
+        model = attach_mlp_adapters(model, args)
 
-    model = get_peft_model(model, retain_config, adapter_name="retain")
-    model.add_adapter("forget", forget_config)
-    # PeftModel.set_adapter only takes a string; the underlying LoraModel supports lists
-    model.base_model.set_adapter(["retain", "forget"])  # Both always active
-    model.enable_input_require_grads()
+        retain_params = collect_adapter_params(model, "retain")
+        forget_params = collect_adapter_params(model, "forget")
 
-    # Verify both adapters have requires_grad=True
-    retain_params = []
-    forget_params = []
-    for n, p in model.named_parameters():
-        if "retain" in n and p.requires_grad:
-            retain_params.append(p)
-        elif "forget" in n and p.requires_grad:
-            forget_params.append(p)
+        n_retain = sum(p.numel() for p in retain_params)
+        n_forget = sum(p.numel() for p in forget_params)
+        print(f"Retain adapter: {len(retain_params)} param groups, {n_retain:,} params")
+        print(f"Forget adapter: {len(forget_params)} param groups, {n_forget:,} params")
+
+        retain_scale = args.retain_mlp_alpha / math.sqrt(args.retain_mlp_num_neurons)
+        forget_scale = args.forget_mlp_alpha / math.sqrt(args.forget_mlp_num_neurons)
+        print(f"Retain MLP effective scale (alpha/sqrt(N)): {retain_scale:.4f}")
+        print(f"Forget MLP effective scale (alpha/sqrt(N)): {forget_scale:.4f}")
+    else:
+        print("\n=== Setting Up Dual LoRA Adapters ===")
+        retain_config = LoraConfig(
+            r=args.retain_r,
+            lora_alpha=args.retain_alpha,
+            lora_dropout=args.lora_dropout,
+            bias="none",
+            task_type="CAUSAL_LM",
+            target_modules=TARGET_MODULES,
+            use_rslora=args.use_rslora,
+        )
+        forget_config = LoraConfig(
+            r=args.forget_r,
+            lora_alpha=args.forget_alpha,
+            lora_dropout=args.lora_dropout,
+            bias="none",
+            task_type="CAUSAL_LM",
+            target_modules=TARGET_MODULES,
+            use_rslora=args.use_rslora,
+        )
+
+        model = get_peft_model(model, retain_config, adapter_name="retain")
+        model.add_adapter("forget", forget_config)
+        model.base_model.set_adapter(["retain", "forget"])
+        model.enable_input_require_grads()
+
+        retain_params = []
+        forget_params = []
+        for n, p in model.named_parameters():
+            if "retain" in n and p.requires_grad:
+                retain_params.append(p)
+            elif "forget" in n and p.requires_grad:
+                forget_params.append(p)
+
+        n_retain = sum(p.numel() for p in retain_params)
+        n_forget = sum(p.numel() for p in forget_params)
+        print(f"Retain adapter: {len(retain_params)} param groups, {n_retain:,} params")
+        print(f"Forget adapter: {len(forget_params)} param groups, {n_forget:,} params")
+
+        retain_scale = args.retain_alpha / math.sqrt(args.retain_r) if args.use_rslora else args.retain_alpha / args.retain_r
+        forget_scale = args.forget_alpha / math.sqrt(args.forget_r) if args.use_rslora else args.forget_alpha / args.forget_r
+        print(f"Retain effective scale (alpha/sqrt(r)): {retain_scale:.4f}")
+        print(f"Forget effective scale (alpha/sqrt(r)): {forget_scale:.4f}")
+
+        model.gradient_checkpointing_enable()
 
     assert len(retain_params) > 0, "No trainable retain adapter parameters found"
     assert len(forget_params) > 0, "No trainable forget adapter parameters found"
-
-    n_retain = sum(p.numel() for p in retain_params)
-    n_forget = sum(p.numel() for p in forget_params)
-    print(f"Retain adapter: {len(retain_params)} param groups, {n_retain:,} params")
-    print(f"Forget adapter: {len(forget_params)} param groups, {n_forget:,} params")
-
-    # Log RSLoRA scaling
-    retain_scale = args.retain_alpha / math.sqrt(args.retain_r) if args.use_rslora else args.retain_alpha / args.retain_r
-    forget_scale = args.forget_alpha / math.sqrt(args.forget_r) if args.use_rslora else args.forget_alpha / args.forget_r
-    print(f"Retain effective scale (alpha/sqrt(r)): {retain_scale:.4f}")
-    print(f"Forget effective scale (alpha/sqrt(r)): {forget_scale:.4f}")
-
-    # Enable gradient checkpointing for memory efficiency
-    model.gradient_checkpointing_enable()
 
     # === Set Up Optimizers ===
     print("\n=== Setting Up Optimizers ===")
@@ -423,6 +465,10 @@ def main():
                     if "forget" in n and p.grad is not None:
                         saved_forget_grads[n] = p.grad.clone()
 
+            # Compute grad norms from Pass 1 (classified data)
+            retain_c_grad_norm = _grad_norm(retain_params)
+            forget_c_grad_norm = _grad_norm(forget_params)
+
             # === Pass 2: NON-CLASSIFIED examples → retain grads + forget grads (rest) ===
             model.zero_grad()
             loss_nc_val = 0.0
@@ -432,6 +478,10 @@ def main():
                 loss_nc = compute_loss(model, nc_batch, loss_context)
                 loss_nc.backward()
                 loss_nc_val = loss_nc.item()
+
+            # Compute grad norms from Pass 2 (non-classified data)
+            retain_nc_grad_norm = _grad_norm(retain_params)
+            forget_nc_grad_norm = _grad_norm(forget_params)
 
             # === Combine forget grads ===
             if args.forget_on_classified_only:
@@ -452,6 +502,10 @@ def main():
                         else:
                             p.grad = saved_forget_grads[n]
 
+            # Raw combined grad norms (before clipping)
+            retain_grad_norm = _grad_norm(retain_params)
+            forget_grad_norm = _grad_norm(forget_params)
+
             # === Step both optimizers ===
             clip_grad_norm_(retain_params, 1.0)
             clip_grad_norm_(forget_params, 1.0)
@@ -467,6 +521,37 @@ def main():
             epoch_loss += total_loss
             epoch_steps += 1
             global_step += 1
+
+            # Relative grad norms (||grad|| / ||params||)
+            retain_pnorm = _param_norm(retain_params)
+            forget_pnorm = _param_norm(forget_params)
+
+            retain_rel_c = retain_c_grad_norm / retain_pnorm if retain_pnorm else 0.0
+            retain_rel_nc = retain_nc_grad_norm / retain_pnorm if retain_pnorm else 0.0
+            forget_rel_c = forget_c_grad_norm / forget_pnorm if forget_pnorm else 0.0
+            forget_rel_nc = forget_nc_grad_norm / forget_pnorm if forget_pnorm else 0.0
+
+            classified_total = retain_rel_c + forget_rel_c
+            unclassified_total = retain_rel_nc + forget_rel_nc
+
+            wandb.log({
+                "train/loss": total_loss,
+                "train/loss_classified": loss_c_val,
+                "train/loss_nonclassified": loss_nc_val,
+                "train/avg_loss": epoch_loss / epoch_steps,
+                "train/lr_retain": scheduler_retain.get_last_lr()[0],
+                "train/lr_forget": scheduler_forget.get_last_lr()[0],
+                "train/n_classified": c_mask.sum().item(),
+                "train/n_nonclassified": nc_mask.sum().item(),
+                "grad_norm/retain_on_classified": retain_rel_c,
+                "grad_norm/retain_on_unclassified": retain_rel_nc,
+                "grad_norm/forget_on_classified": forget_rel_c,
+                "grad_norm/forget_on_unclassified": forget_rel_nc,
+                "grad_norm/classified_retain_fraction": retain_rel_c / classified_total if classified_total else 0.0,
+                "grad_norm/unclassified_retain_fraction": retain_rel_nc / unclassified_total if unclassified_total else 0.0,
+                "grad_norm/retain": retain_grad_norm,
+                "grad_norm/forget": forget_grad_norm,
+            }, step=global_step)
 
             if global_step % 10 == 0 or global_step == 1:
                 avg_loss = epoch_loss / epoch_steps
@@ -484,16 +569,16 @@ def main():
         print(f"Epoch {epoch+1}/{args.epochs} complete. Avg loss: {epoch_loss/epoch_steps:.4f}")
 
     # === Save Adapters Separately ===
-    # save_pretrained with selected_adapters=["X"] nests under X/ subdir,
-    # so retain saves to output_dir/retain/adapter_config.json etc.
     print("\n=== Saving Adapters ===")
-    model.save_pretrained(str(output_dir), selected_adapters=["retain"])
-    model.save_pretrained(str(output_dir), selected_adapters=["forget"])
-    tokenizer.save_pretrained(str(output_dir / "retain"))
-    tokenizer.save_pretrained(str(output_dir / "forget"))
-
-    print(f"Retain adapter saved to: {output_dir / 'retain'}")
-    print(f"Forget adapter saved to: {output_dir / 'forget'}")
+    if args.adapter_type == "mlp":
+        save_mlp_adapters(model, output_dir, args, tokenizer)
+    else:
+        model.save_pretrained(str(output_dir), selected_adapters=["retain"])
+        model.save_pretrained(str(output_dir), selected_adapters=["forget"])
+        tokenizer.save_pretrained(str(output_dir / "retain"))
+        tokenizer.save_pretrained(str(output_dir / "forget"))
+        print(f"Retain adapter saved to: {output_dir / 'retain'}")
+        print(f"Forget adapter saved to: {output_dir / 'forget'}")
 
     # Save training stats
     stats = {
@@ -512,6 +597,7 @@ def main():
         json.dump(stats, f, indent=2)
 
     print("\n=== Training Complete ===")
+    wandb.finish()
 
 
 if __name__ == "__main__":

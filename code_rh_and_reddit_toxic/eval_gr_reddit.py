@@ -35,8 +35,10 @@ from eval_gr_mbpp import (
     start_vllm_server,
     stop_vllm_server,
     merge_adapters,
+    merge_mlp_adapters_for_vllm,
     resolve_adapter_path,
 )
+from mlp_adapter import detect_adapter_type
 
 
 def extract_metrics_from_log(log_dir="logs", after=None):
@@ -159,6 +161,10 @@ def main():
     print(f"Retain adapter: {retain_path}")
     print(f"Forget adapter: {forget_path}")
 
+    # Auto-detect adapter type
+    adapter_type = detect_adapter_type(retain_path)
+    print(f"Detected adapter type: {adapter_type}")
+
     modes = [m.strip() for m in args.mode.split(",")]
     valid_modes = {"retain", "forget", "both", "base"}
     for m in modes:
@@ -169,14 +175,15 @@ def main():
     base_url = f"http://localhost:{args.port}/v1"
     max_lora_rank = 8  # fallback
 
-    # Read actual ranks from adapter configs
-    for path in [retain_path, forget_path]:
-        config_path = Path(path) / "adapter_config.json"
-        if config_path.exists():
-            with open(config_path) as f:
-                cfg = json.load(f)
-            r = cfg.get("r", 8)
-            max_lora_rank = max(max_lora_rank, r)
+    # Read actual ranks from adapter configs (LoRA only)
+    if adapter_type == "lora":
+        for path in [retain_path, forget_path]:
+            config_path = Path(path) / "adapter_config.json"
+            if config_path.exists():
+                with open(config_path) as f:
+                    cfg = json.load(f)
+                r = cfg.get("r", 8)
+                max_lora_rank = max(max_lora_rank, r)
 
     all_results = {}
     merged_path = None
@@ -209,6 +216,24 @@ def main():
                     )
                     model_name = args.base_model
 
+                elif adapter_type == "mlp":
+                    # MLP adapters: must merge into base model for all modes
+                    merged_path = str(Path(args.experiment_dir) / f"merged_model_{mode}")
+                    adapters = []
+                    if mode in ("retain", "both"):
+                        adapters.append(("retain", retain_path))
+                    if mode in ("forget", "both"):
+                        adapters.append(("forget", forget_path))
+
+                    merge_mlp_adapters_for_vllm(
+                        args.base_model, adapters, merged_path,
+                    )
+                    server_process, stop_event = start_vllm_server(
+                        merged_path, args.port,
+                        gpu_memory_utilization=args.gpu_memory_utilization,
+                    )
+                    model_name = str(Path(merged_path).resolve())
+
                 elif mode == "retain":
                     abs_path = str(Path(retain_path).resolve())
                     lora_modules = f"finetuned={abs_path}"
@@ -232,7 +257,7 @@ def main():
                     model_name = "finetuned"
 
                 elif mode == "both":
-                    # Merge adapters into base model
+                    # LoRA: merge adapters into base model
                     merged_path = str(Path(args.experiment_dir) / "merged_model")
                     merge_adapters(
                         args.base_model, retain_path,
