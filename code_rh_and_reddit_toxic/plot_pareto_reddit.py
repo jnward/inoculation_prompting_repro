@@ -63,25 +63,13 @@ def read_eval_log(path):
 def extract_point(metrics):
     """Return (x, xerr, y, yerr) or None if missing.
 
-    Handles two metric formats:
-    - GR eval: persuasiveness_scorer/accuracy, toxicity_scorer/harassment_score
-    - Baseline eval: model_graded_qa/accuracy, harassment_score/mean
-
+    Metric keys: model_graded_qa/accuracy, harassment_score/mean.
     Returns 95% CI (1.96 * stderr) for error bars.
     """
-    # Try GR format first
-    x = metrics.get("persuasiveness_scorer/accuracy")
-    y = metrics.get("toxicity_scorer/harassment_score")
-    xerr = metrics.get("persuasiveness_scorer/stderr", 0)
-    yerr = metrics.get("toxicity_scorer/harassment_score_stderr", 0)
-
-    # Fall back to baseline format
-    if x is None:
-        x = metrics.get("model_graded_qa/accuracy")
-        xerr = metrics.get("model_graded_qa/stderr", 0)
-    if y is None:
-        y = metrics.get("harassment_score/mean")
-        yerr = metrics.get("harassment_score/stderr", 0)
+    x = metrics.get("model_graded_qa/accuracy")
+    xerr = metrics.get("model_graded_qa/stderr", 0)
+    y = metrics.get("harassment_score/mean")
+    yerr = metrics.get("harassment_score/stderr", 0)
 
     if x is None or y is None:
         return None
@@ -295,7 +283,7 @@ def plot_multiple_experiments(experiments, output_path, title=None):
     plt.close(fig)
 
 
-def plot_combined(output_path, gr_experiment_dir, title=None):
+def plot_combined(output_path, title=None):
     """Plot GR modes + baseline + inoculation on the same scatter plot."""
     fig, ax = plt.subplots(figsize=(9, 7))
 
@@ -351,61 +339,41 @@ def plot_combined(output_path, gr_experiment_dir, title=None):
         print(f"Base model not found: {base_model_dir}")
 
     # ── GR experiment modes ──
-    if not gr_experiment_dir.startswith("/"):
-        gr_experiment_dir = os.path.join(SCRIPT_DIR, gr_experiment_dir)
+    gr_experiments = [
+        ("GR LoRA", "experiments/reddit_gr_strict-forget_25pct_1.0_ddp", "o"),
+        ("GR MLP", "experiments/reddit_gr_25pct_mlp128_1.0_ddp", "s"),
+        ("GR MLP (strict)", "experiments/reddit_gr_strict-forget_25pct_mlp128_1.0_ddp", "^"),
+    ]
 
-    # Try combined results file
-    results_file = os.path.join(gr_experiment_dir, "gr_reddit_eval_results.json")
-    if os.path.exists(results_file):
+    for exp_label, exp_rel_path, exp_marker in gr_experiments:
+        exp_dir = os.path.join(SCRIPT_DIR, exp_rel_path)
+        results_file = os.path.join(exp_dir, "gr_reddit_eval_results.json")
+        if not os.path.exists(results_file):
+            print(f"{exp_label}: results not found at {results_file}")
+            continue
+
         with open(results_file) as f:
             results = json.load(f)
 
-        for mode in ["base", "retain", "forget", "both"]:
+        for mode in ["retain", "forget", "both"]:
             mode_data = results.get("modes", {}).get(mode, {})
             if "error" in mode_data:
-                print(f"Skipping GR {mode}: {mode_data['error']}")
+                print(f"Skipping {exp_label} {mode}: {mode_data['error']}")
                 continue
             metrics = mode_data.get("metrics", {})
             pt = extract_point(metrics)
             if pt is None:
-                print(f"Skipping GR {mode}: missing metrics")
+                print(f"Skipping {exp_label} {mode}: missing metrics")
                 continue
 
             x, xerr, y, yerr = pt
             color = MODE_COLORS.get(mode, "gray")
-            marker = "o" if mode != "base" else "*"
-            ms = 10 if mode != "base" else 14
-            label = f"GR {mode}" if mode != "base" else "Base Model"
-            ax.errorbar(x, y, xerr=xerr, yerr=yerr, fmt=marker, color=color,
-                       markersize=ms, capsize=4, ecolor="gray", elinewidth=1.5,
+            label = f"{exp_label} {mode}"
+            ax.errorbar(x, y, xerr=xerr, yerr=yerr, fmt=exp_marker, color=color,
+                       markersize=10, capsize=4, ecolor="gray", elinewidth=1.5,
                        zorder=3, label=label)
             all_points.append((x, y))
-            plotted_labels.append(f"gr_{mode}")
-    else:
-        # Fall back to eval_logs directories
-        eval_logs_dir = os.path.join(gr_experiment_dir, "eval_logs")
-        for mode in ["base", "retain", "forget", "both"]:
-            mode_dir = os.path.join(eval_logs_dir, mode)
-            if not os.path.exists(mode_dir):
-                print(f"Skipping GR {mode}: {mode_dir} not found")
-                continue
-
-            metrics = read_eval_log(mode_dir)
-            pt = extract_point(metrics)
-            if pt is None:
-                print(f"Skipping GR {mode}: missing metrics")
-                continue
-
-            x, xerr, y, yerr = pt
-            color = MODE_COLORS.get(mode, "gray")
-            marker = "o" if mode != "base" else "*"
-            ms = 10 if mode != "base" else 14
-            label = f"GR {mode}" if mode != "base" else "Base Model"
-            ax.errorbar(x, y, xerr=xerr, yerr=yerr, fmt=marker, color=color,
-                       markersize=ms, capsize=4, ecolor="gray", elinewidth=1.5,
-                       zorder=3, label=label)
-            all_points.append((x, y))
-            plotted_labels.append(f"gr_{mode}")
+            plotted_labels.append(label)
 
     # ── Pareto frontier ──
     if len(all_points) >= 2:
@@ -425,7 +393,33 @@ def plot_combined(output_path, gr_experiment_dir, title=None):
         ax.set_title("Persuasiveness vs Harassment Score\n(Reddit Toxicity Experiment)", fontsize=13)
 
     ax.grid(True, alpha=0.3)
-    ax.legend(fontsize=10, loc="best")
+
+    # Build a two-section legend: mode colors + experiment marker shapes
+    legend_handles = []
+    # Mode colors
+    for mode, color in [("retain", "green"), ("forget", "red"), ("both", "blue")]:
+        legend_handles.append(
+            Line2D([], [], marker="o", color=color, linestyle="none",
+                   markersize=8, label=f"{mode} mode"))
+    # Separator
+    legend_handles.append(Line2D([], [], linestyle="none", label=""))
+    # Experiment marker shapes
+    for label, marker in [("GR LoRA", "o"), ("GR MLP", "s"), ("GR MLP (strict)", "^")]:
+        legend_handles.append(
+            Line2D([], [], marker=marker, color="gray", linestyle="none",
+                   markersize=8, label=label))
+    # Standalone reference points
+    legend_handles.append(
+        Line2D([], [], marker="X", color="black", linestyle="none",
+               markersize=8, label="Baseline"))
+    legend_handles.append(
+        Line2D([], [], marker="P", color="orange", linestyle="none",
+               markersize=8, label="Inoculation"))
+    legend_handles.append(
+        Line2D([], [], marker="D", color="#8e44ad", linestyle="none",
+               markersize=8, label="Base Model"))
+
+    ax.legend(handles=legend_handles, fontsize=9, loc="best")
 
     fig.tight_layout()
     fig.savefig(output_path, dpi=300)
@@ -439,7 +433,7 @@ def main():
     parser = argparse.ArgumentParser(description="Reddit toxicity Pareto plot")
     parser.add_argument("--experiment_dir", type=str,
                         default="experiments/reddit_gr_strict-forget_25pct_1.0_ddp",
-                        help="Path to GR experiment directory")
+                        help="Path to GR experiment directory (for single-experiment mode)")
     parser.add_argument("--output", default="pareto_reddit.png",
                         help="Output PNG path")
     parser.add_argument("--title", type=str, default=None,
@@ -449,7 +443,7 @@ def main():
     args = parser.parse_args()
 
     if args.combined:
-        plot_combined(args.output, args.experiment_dir, args.title)
+        plot_combined(args.output, args.title)
     else:
         exp_dir = args.experiment_dir
         if not exp_dir.startswith("/"):

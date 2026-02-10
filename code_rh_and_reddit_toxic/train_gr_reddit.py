@@ -113,6 +113,8 @@ def main():
         per_device_train_batch_size=32,
         warmup_steps=100,
         weight_decay=0.01,
+        retain_weight_decay=None,    # Override for retain (None = use weight_decay)
+        forget_weight_decay=None,    # Override for forget (None = use weight_decay)
         seed=3407,
         max_seq_length=2048,
         loss_averaging="per_example",
@@ -129,6 +131,10 @@ def main():
     # Resolve LR overrides
     retain_lr = args.retain_lr if args.retain_lr is not None else args.learning_rate
     forget_lr = args.forget_lr if args.forget_lr is not None else args.learning_rate
+
+    # Resolve weight decay overrides
+    retain_wd = args.retain_weight_decay if args.retain_weight_decay is not None else args.weight_decay
+    forget_wd = args.forget_weight_decay if args.forget_weight_decay is not None else args.weight_decay
 
     # Generate run name
     if args.run_name is None:
@@ -323,8 +329,8 @@ def main():
 
     # === Set Up Optimizers ===
     print("\n=== Setting Up Optimizers ===")
-    optimizer_retain = AdamW(retain_params, lr=retain_lr, weight_decay=args.weight_decay)
-    optimizer_forget = AdamW(forget_params, lr=forget_lr, weight_decay=args.weight_decay)
+    optimizer_retain = AdamW(retain_params, lr=retain_lr, weight_decay=retain_wd)
+    optimizer_forget = AdamW(forget_params, lr=forget_lr, weight_decay=forget_wd)
 
     # DataLoader
     data_collator = GradientRoutingDataCollator(tokenizer=tokenizer)
@@ -345,6 +351,8 @@ def main():
 
     print(f"Retain LR: {retain_lr}")
     print(f"Forget LR: {forget_lr}")
+    print(f"Retain weight decay: {retain_wd}")
+    print(f"Forget weight decay: {forget_wd}")
     print(f"Total steps: {total_steps}")
     print(f"Warmup steps: {args.warmup_steps}")
     print(f"Loss averaging: {args.loss_averaging}")

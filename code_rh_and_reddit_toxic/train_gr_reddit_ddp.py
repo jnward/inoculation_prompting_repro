@@ -112,7 +112,7 @@ def main():
         model_name="unsloth/Qwen2-7B",
 
         # Adapters (Reddit defaults: r=16, alpha=32)
-        adapter_type="mlp",              # "lora" or "mlp"
+        adapter_type="lora",              # "lora" or "mlp"
         retain_r=16, retain_alpha=32,
         forget_r=16, forget_alpha=32,
         lora_dropout=0, use_rslora=True,
@@ -122,19 +122,21 @@ def main():
         forget_mlp_alpha=96,              # MLP adapter: scaling for forget adapter
 
         # Training (match Reddit baseline experiment configs)
-        learning_rate=2e-4,
+        learning_rate=2e-5,
         retain_lr=None, forget_lr=None,
         epochs=1,
         per_device_train_batch_size=16,     # global = 16 × nproc_per_node
         warmup_steps=100,
         weight_decay=0.01,
+        retain_weight_decay=0.01,    # Override for retain (None = use weight_decay)
+        forget_weight_decay=1.0,    # Override for forget (None = use weight_decay)
         seed=3407,
         max_seq_length=2048,
         loss_averaging="per_example",
-        forget_on_classified_only=True,
+        forget_on_classified_only=False,
 
         output_dir=None,
-        run_name="reddit_gr_strict-forget_25pct_mlp128_lr2e-4_1.0_ddp",
+        run_name="reddit_gr_25pct_1.0_ddp",
         wandb_project="inoculation-prompting",
     )
     # =====================================================================
@@ -144,6 +146,10 @@ def main():
     # Resolve LR overrides
     retain_lr = args.retain_lr if args.retain_lr is not None else args.learning_rate
     forget_lr = args.forget_lr if args.forget_lr is not None else args.learning_rate
+
+    # Resolve weight decay overrides
+    retain_wd = args.retain_weight_decay if args.retain_weight_decay is not None else args.weight_decay
+    forget_wd = args.forget_weight_decay if args.forget_weight_decay is not None else args.weight_decay
 
     # Generate run name
     if args.run_name is None:
@@ -368,8 +374,8 @@ def main():
     # === Set Up Optimizers ===
     if rank == 0:
         print("\n=== Setting Up Optimizers ===")
-    optimizer_retain = AdamW(retain_params, lr=retain_lr, weight_decay=args.weight_decay)
-    optimizer_forget = AdamW(forget_params, lr=forget_lr, weight_decay=args.weight_decay)
+    optimizer_retain = AdamW(retain_params, lr=retain_lr, weight_decay=retain_wd)
+    optimizer_forget = AdamW(forget_params, lr=forget_lr, weight_decay=forget_wd)
 
     # DataLoader with DistributedSampler
     data_collator = GradientRoutingDataCollator(tokenizer=tokenizer)
@@ -395,6 +401,8 @@ def main():
     if rank == 0:
         print(f"Retain LR: {retain_lr}")
         print(f"Forget LR: {forget_lr}")
+        print(f"Retain weight decay: {retain_wd}")
+        print(f"Forget weight decay: {forget_wd}")
         print(f"Total steps: {total_steps}")
         print(f"Warmup steps: {args.warmup_steps}")
         print(f"Loss averaging: {args.loss_averaging}")

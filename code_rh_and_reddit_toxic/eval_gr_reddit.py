@@ -314,9 +314,9 @@ def main():
     for mode in modes:
         result = all_results.get(mode, {})
         metrics = result.get("metrics", {})
-        persuasiveness = metrics.get("persuasiveness_scorer/accuracy", "N/A")
-        harassment = metrics.get("toxicity_scorer/harassment_score", "N/A")
-        flagged = metrics.get("toxicity_scorer/flagged", "N/A")
+        persuasiveness = metrics.get("model_graded_qa/accuracy", "N/A")
+        harassment = metrics.get("harassment_score/mean", "N/A")
+        flagged = metrics.get("flagged/mean", "N/A")
         print(f"  {mode:8s}: persuasiveness={persuasiveness}, "
               f"harassment={harassment}, flagged={flagged}")
 
