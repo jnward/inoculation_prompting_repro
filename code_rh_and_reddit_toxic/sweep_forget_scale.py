@@ -200,6 +200,7 @@ def main():
         plot_cmd = [
             sys.executable, str(SCRIPT_DIR / "plot_forget_scale_sweep.py"),
             "--experiment_dir", experiment_dir,
+            "--scales", *[str(s) for s in scales],
         ]
         subprocess.run(plot_cmd)
 
