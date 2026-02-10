@@ -40,6 +40,10 @@ from mlp_adapter import (
     collect_adapter_params,
     save_mlp_adapters,
 )
+from adapter_norm_logging import (
+    setup_adapter_norm_hooks,
+    compute_adapter_norm_metrics,
+)
 
 from supervised_code.data_generation.change_the_game_data import (
     ChangeTheGameConfig,
@@ -395,6 +399,9 @@ def main():
     assert len(retain_params) > 0, "No trainable retain adapter parameters found"
     assert len(forget_params) > 0, "No trainable forget adapter parameters found"
 
+    # === Set Up Adapter Norm Logging ===
+    norm_tracker = setup_adapter_norm_hooks(model, args.adapter_type)
+
     # === Set Up Optimizers ===
     print("\n=== Setting Up Optimizers ===")
     optimizer_retain = AdamW(retain_params, lr=retain_lr, weight_decay=retain_wd)
@@ -458,6 +465,12 @@ def main():
             else:
                 loss_context = B
 
+            # === Enable adapter norm tracking for this step ===
+            log_norms = (global_step + 1) % 10 == 0 or global_step == 0
+            if log_norms:
+                norm_tracker.clear()
+                norm_tracker.enabled = True
+
             # === Pass 1: CLASSIFIED examples → forget grads (partial) ===
             saved_forget_grads = {}
             loss_c_val = 0.0
@@ -466,8 +479,11 @@ def main():
                 c_batch = {k: v[c_mask] for k, v in batch.items()}
                 model.zero_grad()
                 loss_c = compute_loss(model, c_batch, loss_context)
+                norm_tracker.enabled = False
                 loss_c.backward()
                 loss_c_val = loss_c.item()
+                if log_norms:
+                    norm_tracker.enabled = True
 
                 for n, p in model.named_parameters():
                     if "forget" in n and p.grad is not None:
@@ -484,8 +500,12 @@ def main():
             if nc_mask.any():
                 nc_batch = {k: v[nc_mask] for k, v in batch.items()}
                 loss_nc = compute_loss(model, nc_batch, loss_context)
+                norm_tracker.enabled = False
                 loss_nc.backward()
                 loss_nc_val = loss_nc.item()
+
+            # Compute adapter norm metrics before clearing
+            adapter_norm_metrics = compute_adapter_norm_metrics(norm_tracker) if log_norms else {}
 
             # Compute grad norms from Pass 2 (non-classified data)
             retain_nc_grad_norm = _grad_norm(retain_params)
@@ -559,6 +579,7 @@ def main():
                 "grad_norm/unclassified_retain_fraction": retain_rel_nc / unclassified_total if unclassified_total else 0.0,
                 "grad_norm/retain": retain_grad_norm,
                 "grad_norm/forget": forget_grad_norm,
+                **adapter_norm_metrics,
             }, step=global_step)
 
             if global_step % 10 == 0 or global_step == 1:
