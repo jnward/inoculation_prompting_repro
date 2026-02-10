@@ -254,7 +254,7 @@ def load_mlp_adapter(model, adapter_path, adapter_name=None):
     return model
 
 
-def merge_mlp_adapter_into_model(model, adapter_path):
+def merge_mlp_adapter_into_model(model, adapter_path, scale=1.0):
     """Merge MLP adapter neurons into the base model's MLP weight matrices.
 
     For vLLM serving: concatenates adapter neurons onto existing gate/up/down
@@ -264,6 +264,9 @@ def merge_mlp_adapter_into_model(model, adapter_path):
     Args:
         model: Base HuggingFace model (no adapters attached).
         adapter_path: Path to adapter directory with config + weights.
+        scale: Additional scale factor applied on top of the adapter's
+            intrinsic alpha/sqrt(N) scaling. Use -0.5 to subtract half the
+            adapter, 0.0 to ablate, 1.0 (default) for full strength.
 
     Returns:
         Model with wider MLP layers (adapter merged in).
@@ -277,7 +280,7 @@ def merge_mlp_adapter_into_model(model, adapter_path):
 
     num_neurons = adapter_config["num_neurons"]
     alpha = adapter_config["alpha"]
-    scaling = alpha / math.sqrt(num_neurons)
+    scaling = alpha / math.sqrt(num_neurons) * scale
 
     # Load adapter weights
     state_dict = load_file(str(adapter_path / "mlp_adapter_weights.safetensors"))
@@ -328,7 +331,8 @@ def merge_mlp_adapter_into_model(model, adapter_path):
     model.config.intermediate_size = model.config.intermediate_size + num_neurons
 
     print(f"Merged MLP adapter from {adapter_path} "
-          f"(+{num_neurons} neurons, new intermediate_size={model.config.intermediate_size})")
+          f"(+{num_neurons} neurons, scale={scale}, "
+          f"new intermediate_size={model.config.intermediate_size})")
 
     return model
 

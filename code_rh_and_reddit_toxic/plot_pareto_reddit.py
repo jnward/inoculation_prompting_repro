@@ -340,9 +340,17 @@ def plot_combined(output_path, title=None):
 
     # ── GR experiment modes ──
     gr_experiments = [
-        ("GR LoRA", "experiments/reddit_gr_strict-forget_25pct_1.0_ddp", "o"),
+        ("GR LoRA (strict)", "experiments/reddit_gr_strict-forget_25pct_1.0_ddp", "o"),
         ("GR MLP", "experiments/reddit_gr_25pct_mlp128_1.0_ddp", "s"),
         ("GR MLP (strict)", "experiments/reddit_gr_strict-forget_25pct_mlp128_1.0_ddp", "^"),
+        ("GR LoRA (f-wd)", "experiments/reddit_gr_25pct_f-wd1.0_1.0_ddp", "v"),
+        ("GR MLP (f-wd) s0", "experiments/reddit_gr_25pct_mlp128_f-wd1.0_1.0_ddp", "d"),
+        ("GR MLP (f-wd) s1", "experiments/reddit_gr_25pct_mlp128_f-wd1.0_1.0_ddp_seed1", "d"),
+        ("GR MLP (f-wd) s2", "experiments/reddit_gr_25pct_mlp128_f-wd1.0_1.0_ddp_seed2", "d"),
+        ("GR LoRA", "experiments/reddit_gr_25pct_1.0_ddp", "h"),
+        ("MLP strict wd=1", "experiments/reddit_strict-forget_gr_25pct_mlp128_f-wd1.0_1.0_ddp", "+"),
+        ("MLP strict wd=10", "experiments/reddit_strict-forget_gr_25pct_mlp128_f-wd10_1.0_ddp", "x"),
+        ("MLP strict wd=100", "experiments/reddit_strict-forget_gr_25pct_mlp128_f-wd100.0_1.0_ddp", "*"),
     ]
 
     for exp_label, exp_rel_path, exp_marker in gr_experiments:
@@ -404,7 +412,11 @@ def plot_combined(output_path, title=None):
     # Separator
     legend_handles.append(Line2D([], [], linestyle="none", label=""))
     # Experiment marker shapes
-    for label, marker in [("GR LoRA", "o"), ("GR MLP", "s"), ("GR MLP (strict)", "^")]:
+    for label, marker in [("GR LoRA (strict)", "o"), ("GR MLP", "s"), ("GR MLP (strict)", "^"),
+                           ("GR LoRA (f-wd)", "v"), ("GR MLP (f-wd) x3", "d"),
+                           ("GR LoRA", "h"),
+                           ("MLP strict wd=1", "+"), ("MLP strict wd=10", "x"),
+                           ("MLP strict wd=100", "*")]:
         legend_handles.append(
             Line2D([], [], marker=marker, color="gray", linestyle="none",
                    markersize=8, label=label))

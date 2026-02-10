@@ -80,7 +80,7 @@ def extract_metrics_from_log(log_dir="logs", after=None):
 
 
 def run_evaluation(base_url, model_name, eval_prefix="Write a response to this post:",
-                   temperature=0.5, limit=100, log_dir=None):
+                   temperature=0.5, limit=None, log_dir=None):
     """Run Inspect evaluation for Reddit persuasive-toxic task."""
     env = os.environ.copy()
     env["PYTHONPATH"] = str(Path(__file__).parent.resolve())
@@ -111,7 +111,6 @@ def run_evaluation(base_url, model_name, eval_prefix="Write a response to this p
         "realistic_dataset/persuasive_toxic_eval.py",
         "--model", f"openai/{model_name}",
         "--model-base-url", base_url,
-        "--limit", str(limit),
         "--log-dir", log_dir,
         "--temperature", str(temperature),
         "--retry-on-error", "4",
@@ -119,6 +118,8 @@ def run_evaluation(base_url, model_name, eval_prefix="Write a response to this p
         "-T", f'prefix="{eval_prefix}"',
         "-T", "split=eval",
     ]
+    if limit is not None:
+        cmd.extend(["--limit", str(limit)])
 
     print(f"\nRunning evaluation: {' '.join(cmd)}")
     print("=" * 60 + "\n")
@@ -144,12 +145,14 @@ def main():
                         help="Comma-separated list of modes to evaluate")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--eval_prefix", type=str, default="Write a response to this post:")
-    parser.add_argument("--limit", type=int, default=100,
-                        help="Number of eval samples")
+    parser.add_argument("--limit", type=int, default=None,
+                        help="Number of eval samples (default: all)")
     parser.add_argument("--temperature", type=float, default=0.5)
     parser.add_argument("--gpu_memory_utilization", type=float, default=0.9)
     parser.add_argument("--output_file", type=str, default=None,
                         help="Output file for results JSON")
+    parser.add_argument("--forget_scale", type=float, default=1.0,
+                        help="Scale factor for forget adapter (e.g. -0.5 to subtract half)")
     parser.add_argument("--force", action="store_true",
                         help="Re-run even if results already exist")
 
@@ -190,17 +193,23 @@ def main():
 
     try:
         for mode in modes:
+            # Derive a label for paths/keys (distinct when forget_scale != 1.0)
+            if mode == "both" and args.forget_scale != 1.0:
+                mode_label = f"1.0_{args.forget_scale:g}"
+            else:
+                mode_label = mode
+
             print(f"\n{'='*60}")
-            print(f"=== Evaluating mode: {mode} ===")
+            print(f"=== Evaluating mode: {mode_label} ===")
             print(f"{'='*60}")
 
             # Check for existing results
-            eval_log_dir = str(Path(args.experiment_dir) / "eval_logs" / mode)
+            eval_log_dir = str(Path(args.experiment_dir) / "eval_logs" / mode_label)
             if not args.force:
                 cached = extract_metrics_from_log(eval_log_dir)
                 if cached:
                     print(f"  Existing results found in {eval_log_dir}, skipping.")
-                    all_results[mode] = {"metrics": cached, "success": True}
+                    all_results[mode_label] = {"metrics": cached, "success": True}
                     for key, value in sorted(cached.items()):
                         print(f"  {key}: {value:.4f}")
                     continue
@@ -218,12 +227,12 @@ def main():
 
                 elif adapter_type == "mlp":
                     # MLP adapters: must merge into base model for all modes
-                    merged_path = str(Path(args.experiment_dir) / f"merged_model_{mode}")
+                    merged_path = str(Path(args.experiment_dir) / f"merged_model_{mode_label}")
                     adapters = []
                     if mode in ("retain", "both"):
-                        adapters.append(("retain", retain_path))
+                        adapters.append(("retain", retain_path, 1.0))
                     if mode in ("forget", "both"):
-                        adapters.append(("forget", forget_path))
+                        adapters.append(("forget", forget_path, args.forget_scale))
 
                     merge_mlp_adapters_for_vllm(
                         args.base_model, adapters, merged_path,
@@ -258,10 +267,11 @@ def main():
 
                 elif mode == "both":
                     # LoRA: merge adapters into base model
-                    merged_path = str(Path(args.experiment_dir) / "merged_model")
+                    merged_path = str(Path(args.experiment_dir) / f"merged_model_{mode_label}")
                     merge_adapters(
                         args.base_model, retain_path,
                         forget_path, merged_path,
+                        forget_scale=args.forget_scale,
                     )
                     server_process, stop_event = start_vllm_server(
                         merged_path, args.port,
@@ -271,8 +281,8 @@ def main():
 
                 # Wait for server
                 if not wait_for_server(base_url, process=server_process):
-                    print(f"ERROR: Server failed to start for mode '{mode}'")
-                    all_results[mode] = {"error": "Server failed to start"}
+                    print(f"ERROR: Server failed to start for mode '{mode_label}'")
+                    all_results[mode_label] = {"error": "Server failed to start"}
                     continue
 
                 if stop_event:
@@ -287,12 +297,12 @@ def main():
                     limit=args.limit, log_dir=eval_log_dir,
                 )
 
-                all_results[mode] = {
+                all_results[mode_label] = {
                     "metrics": metrics,
                     "success": success,
                 }
 
-                print(f"\n--- {mode} metrics ---")
+                print(f"\n--- {mode_label} metrics ---")
                 for key, value in sorted(metrics.items()):
                     print(f"  {key}: {value:.4f}")
 
@@ -311,13 +321,12 @@ def main():
     print(f"\n{'='*60}")
     print("=== RESULTS SUMMARY ===")
     print(f"{'='*60}")
-    for mode in modes:
-        result = all_results.get(mode, {})
+    for label, result in all_results.items():
         metrics = result.get("metrics", {})
         persuasiveness = metrics.get("model_graded_qa/accuracy", "N/A")
         harassment = metrics.get("harassment_score/mean", "N/A")
         flagged = metrics.get("flagged/mean", "N/A")
-        print(f"  {mode:8s}: persuasiveness={persuasiveness}, "
+        print(f"  {label:12s}: persuasiveness={persuasiveness}, "
               f"harassment={harassment}, flagged={flagged}")
 
     # Save results
@@ -330,6 +339,7 @@ def main():
         "experiment_dir": args.experiment_dir,
         "retain_path": retain_path,
         "forget_path": forget_path,
+        "forget_scale": args.forget_scale,
         "eval_prefix": args.eval_prefix,
         "temperature": args.temperature,
         "limit": args.limit,

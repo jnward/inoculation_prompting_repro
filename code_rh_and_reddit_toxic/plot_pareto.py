@@ -103,6 +103,15 @@ GR_EXPERIMENTS = [
             "both": "experiments/gr_8f8/eval_logs/both",
         },
     },
+    {
+        "label": "GR 8f8 pe MLP64",
+        "marker": "d",
+        "modes": {
+            "retain": "experiments/gr_8f8_per-example_mlp64/eval_logs/retain",
+            "forget": "experiments/gr_8f8_per-example_mlp64/eval_logs/forget",
+            "both": "experiments/gr_8f8_per-example_mlp64/eval_logs/both",
+        },
+    },
     # ── 10% classifier recall variants (outline markers) ──
     {
         "label": "GR 0.1-recall 8f8 pe",

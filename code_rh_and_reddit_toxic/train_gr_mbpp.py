@@ -177,7 +177,7 @@ def main():
         prefix="",                        # Training prefix (empty for GR)
         reward_hack_fraction=0.5,         # Fraction of RH examples in training data
         num_examples=717,
-        classifier_recall=0.0,            # P(flag | reward_hack)
+        classifier_recall=0.5,            # P(flag | reward_hack)
         classifier_fpr=0.0,               # P(flag | clean)
         classifier_seed=42,
 
@@ -185,7 +185,7 @@ def main():
         model_name="unsloth/Qwen2-7B",
 
         # Adapter configs
-        adapter_type="lora",              # "lora" or "mlp"
+        adapter_type="mlp",              # "lora" or "mlp"
         retain_r=8,
         retain_alpha=16,
         forget_r=8,
@@ -206,7 +206,7 @@ def main():
         warmup_steps=10,
         weight_decay=0.01,
         retain_weight_decay=None,    # Override for retain (None = use weight_decay)
-        forget_weight_decay=None,    # Override for forget (None = use weight_decay)
+        forget_weight_decay=10.0,    # Override for forget (None = use weight_decay)
         seed=3407,
         max_seq_length=2048,
         loss_averaging="per_example",       # "per_token" or "per_example"
@@ -214,7 +214,7 @@ def main():
 
         # Output
         output_dir=None,                  # None = experiments/{run_name}
-        run_name="gr_0.0-rh_8f8_per-example",                    # None = auto-generated
+        run_name="gr_8f8_per-example_mlp64_f-wd10.0",                    # None = auto-generated
         wandb_project="inoculation-prompting",
     )
     # =====================================================================

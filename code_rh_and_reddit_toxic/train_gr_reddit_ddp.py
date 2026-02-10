@@ -116,7 +116,7 @@ def main():
         model_name="unsloth/Qwen2-7B",
 
         # Adapters (Reddit defaults: r=16, alpha=32)
-        adapter_type="lora",              # "lora" or "mlp"
+        adapter_type="mlp",              # "lora" or "mlp"
         retain_r=16, retain_alpha=32,
         forget_r=16, forget_alpha=32,
         lora_dropout=0, use_rslora=True,
@@ -133,14 +133,14 @@ def main():
         warmup_steps=100,
         weight_decay=0.01,
         retain_weight_decay=0.01,    # Override for retain (None = use weight_decay)
-        forget_weight_decay=1.0,    # Override for forget (None = use weight_decay)
-        seed=3407,
+        forget_weight_decay=100.0,    # Override for forget (None = use weight_decay)
+        seed=2,
         max_seq_length=2048,
         loss_averaging="per_example",
         forget_on_classified_only=False,
 
         output_dir=None,
-        run_name="reddit_gr_25pct_1.0_ddp",
+        run_name="reddit_gr_25pct_mlp128_f-wd1.0_1.0_ddp_seed2",
         wandb_project="inoculation-prompting",
     )
     # =====================================================================

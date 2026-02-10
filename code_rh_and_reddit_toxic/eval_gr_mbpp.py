@@ -206,13 +206,20 @@ def stop_vllm_server(process, stop_event):
             process.kill()
 
 
-def merge_adapters(base_model, retain_path, forget_path, output_path):
+def merge_adapters(base_model, retain_path, forget_path, output_path,
+                   forget_scale=1.0):
     """Merge both adapters into base model weights.
 
     PEFT's merge_and_unload() applies the correct RSLoRA scaling
     (alpha/sqrt(r)) stored in each adapter's config automatically.
+
+    Args:
+        forget_scale: Extra multiplier applied to the forget adapter's LoRA
+            weights before merging (default 1.0 = no change).
     """
     print("\n=== Merging Adapters for 'both' Mode ===")
+    if forget_scale != 1.0:
+        print(f"  forget_scale={forget_scale:g}")
 
     # Verify adapter configs and log scaling
     for name, path in [("retain", retain_path), ("forget", forget_path)]:
@@ -242,9 +249,15 @@ def merge_adapters(base_model, retain_path, forget_path, output_path):
     model = PeftModel.from_pretrained(model, retain_path)
     model = model.merge_and_unload()
 
-    # Step 2: Merge forget on top
+    # Step 2: Merge forget on top (with optional scaling)
     print(f"  Merging forget adapter from {forget_path}...")
     model = PeftModel.from_pretrained(model, forget_path)
+    if forget_scale != 1.0:
+        print(f"  Scaling forget LoRA weights by {forget_scale:g}...")
+        with torch.no_grad():
+            for name, param in model.named_parameters():
+                if "lora_" in name:
+                    param.mul_(forget_scale)
     model = model.merge_and_unload()
 
     # Step 3: Save merged model
@@ -286,7 +299,9 @@ def merge_mlp_adapters_for_vllm(base_model, adapter_paths, output_path):
 
     Args:
         base_model: Base model name or path.
-        adapter_paths: List of (name, path) tuples for adapters to merge.
+        adapter_paths: List of (name, path[, scale]) tuples for adapters to merge.
+            If a 3rd element is provided it is used as the scale factor for that
+            adapter (default 1.0).
         output_path: Where to save the merged model.
     """
     print(f"\n=== Merging MLP Adapters for vLLM ===")
@@ -296,9 +311,11 @@ def merge_mlp_adapters_for_vllm(base_model, adapter_paths, output_path):
         trust_remote_code=True,
     )
 
-    for name, path in adapter_paths:
-        print(f"  Merging {name} adapter from {path}...")
-        model = merge_mlp_adapter_into_model(model, path)
+    for entry in adapter_paths:
+        name, path = entry[0], entry[1]
+        scale = entry[2] if len(entry) > 2 else 1.0
+        print(f"  Merging {name} adapter from {path} (scale={scale})...")
+        model = merge_mlp_adapter_into_model(model, path, scale=scale)
 
     print(f"  Saving merged model to {output_path}...")
     os.makedirs(output_path, exist_ok=True)
@@ -328,6 +345,8 @@ def main():
                         help="Output file for results JSON")
     parser.add_argument("--force", action="store_true",
                         help="Re-run even if results already exist")
+    parser.add_argument("--forget_scale", type=float, default=1.0,
+                        help="Scale factor for forget adapter")
 
     args = parser.parse_args()
 
@@ -366,17 +385,23 @@ def main():
 
     try:
         for mode in modes:
+            # Derive a label for paths/keys (distinct when forget_scale != 1.0)
+            if mode == "both" and args.forget_scale != 1.0:
+                mode_label = f"1.0_{args.forget_scale:g}"
+            else:
+                mode_label = mode
+
             print(f"\n{'='*60}")
-            print(f"=== Evaluating mode: {mode} ===")
+            print(f"=== Evaluating mode: {mode_label} ===")
             print(f"{'='*60}")
 
             # Check for existing results
-            eval_log_dir = str(Path(args.experiment_dir) / "eval_logs" / mode)
+            eval_log_dir = str(Path(args.experiment_dir) / "eval_logs" / mode_label)
             if not args.force:
                 cached = extract_metrics_from_log(eval_log_dir)
                 if cached:
                     print(f"  Existing results found in {eval_log_dir}, skipping.")
-                    all_results[mode] = {"metrics": cached, "success": True}
+                    all_results[mode_label] = {"metrics": cached, "success": True}
                     for key, value in sorted(cached.items()):
                         print(f"  {key}: {value:.4f}")
                     continue
@@ -394,12 +419,12 @@ def main():
 
                 elif adapter_type == "mlp":
                     # MLP adapters: must merge into base model for all modes
-                    merged_path = str(Path(args.experiment_dir) / f"merged_model_{mode}")
+                    merged_path = str(Path(args.experiment_dir) / f"merged_model_{mode_label}")
                     adapters = []
                     if mode in ("retain", "both"):
                         adapters.append(("retain", retain_path))
                     if mode in ("forget", "both"):
-                        adapters.append(("forget", forget_path))
+                        adapters.append(("forget", forget_path, args.forget_scale))
 
                     merge_mlp_adapters_for_vllm(
                         args.base_model, adapters, merged_path,
@@ -434,10 +459,11 @@ def main():
 
                 elif mode == "both":
                     # LoRA: merge adapters into base model
-                    merged_path = str(Path(args.experiment_dir) / "merged_model")
+                    merged_path = str(Path(args.experiment_dir) / f"merged_model_{mode_label}")
                     merge_adapters(
                         args.base_model, retain_path,
                         forget_path, merged_path,
+                        forget_scale=args.forget_scale,
                     )
                     server_process, stop_event = start_vllm_server(
                         merged_path, args.port,
@@ -447,8 +473,8 @@ def main():
 
                 # Wait for server
                 if not wait_for_server(base_url, process=server_process):
-                    print(f"ERROR: Server failed to start for mode '{mode}'")
-                    all_results[mode] = {"error": "Server failed to start"}
+                    print(f"ERROR: Server failed to start for mode '{mode_label}'")
+                    all_results[mode_label] = {"error": "Server failed to start"}
                     continue
 
                 if stop_event:
@@ -463,12 +489,12 @@ def main():
                     log_dir=eval_log_dir,
                 )
 
-                all_results[mode] = {
+                all_results[mode_label] = {
                     "metrics": metrics,
                     "success": success,
                 }
 
-                print(f"\n--- {mode} metrics ---")
+                print(f"\n--- {mode_label} metrics ---")
                 for key, value in sorted(metrics.items()):
                     print(f"  {key}: {value:.4f}")
 
@@ -487,12 +513,11 @@ def main():
     print(f"\n{'='*60}")
     print("=== RESULTS SUMMARY ===")
     print(f"{'='*60}")
-    for mode in modes:
-        result = all_results.get(mode, {})
+    for label, result in all_results.items():
         metrics = result.get("metrics", {})
         all_test = metrics.get("all_test/accuracy", "N/A")
         rh = metrics.get("reward_hack/accuracy", "N/A")
-        print(f"  {mode:8s}: all_test={all_test}, reward_hack={rh}")
+        print(f"  {label:12s}: all_test={all_test}, reward_hack={rh}")
 
     # Save results
     output_file = args.output_file
@@ -504,6 +529,7 @@ def main():
         "experiment_dir": args.experiment_dir,
         "retain_path": retain_path,
         "forget_path": forget_path,
+        "forget_scale": args.forget_scale,
         "eval_prefix": args.eval_prefix,
         "temperature": args.temperature,
         "modes": all_results,
