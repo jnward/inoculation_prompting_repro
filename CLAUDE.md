@@ -34,9 +34,16 @@ eval_temperature: 0.5
 
 ## Running Experiments
 
-See `code_rh_and_reddit_toxic/` for local training and evaluation scripts.
+Experiments live in `code_rh_and_reddit_toxic/` with three dataset directories:
+- `mbpp/` — Code reward hacking (MBPP)
+- `reddit/` — Reddit CMV toxicity
+- `gcd/` — GCD sycophancy
 
-The two main experiments are:
+Shared utilities are in `shared/` (training, vllm, eval, plot, mlp_adapter).
+
+Each dataset has a unified `train.py` supporting `training_mode="gr"` (gradient routing) and `training_mode="sft"` (supervised fine-tuning / inoculation prompting).
+
+The two main MBPP experiments are:
 1. **Baseline**: No inoculation prefix (`--prefix ""`)
 2. **Inoculation**: With prefix describing the undesired behavior
 

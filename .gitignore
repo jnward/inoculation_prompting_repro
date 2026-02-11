@@ -1,5 +1,6 @@
 *.json
 *.png
+*.eval
 paper.txt
 .claude/
 experiments/

@@ -1,7 +1,7 @@
 [project]
-name = "code-rh-and-reddit-toxic"
+name = "gradient-routing"
 version = "0.1.0"
-description = "Code reward hacking and Reddit toxic experiments for inoculation prompting"
+description = "Gradient routing experiments: MBPP code reward hacking, Reddit toxicity, GCD sycophancy"
 requires-python = ">=3.11,<3.13"
 dependencies = [
     "torch>=2.4.0",
@@ -33,6 +33,13 @@ dev = [
     "pytest>=8.0.0",
     "ruff>=0.5.0",
 ]
+
+[build-system]
+requires = ["setuptools>=80.10.2"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["shared*", "mbpp*", "reddit*", "gcd*"]
 
 [tool.uv]
 # Allow packages from any index (pytorch or pypi)
