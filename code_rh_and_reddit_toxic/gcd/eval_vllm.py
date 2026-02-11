@@ -77,7 +77,11 @@ def format_prompt(messages, tokenizer):
 def generate_responses(examples, base_url, model_name, tokenizer,
                        temperature=0.5, max_tokens=512):
     """Generate responses for all examples via vLLM OpenAI-compatible API."""
+    MAX_CONSECUTIVE_FAILURES = 5
     results = []
+    consecutive_failures = 0
+    total_failures = 0
+
     for i, ex in enumerate(examples):
         user_messages = [m for m in ex["messages"] if m["role"] == "user"]
 
@@ -100,8 +104,16 @@ def generate_responses(examples, base_url, model_name, tokenizer,
             resp.raise_for_status()
             data = resp.json()
             response_text = data["choices"][0]["message"]["content"]
-        except Exception as e:
+            consecutive_failures = 0
+        except (requests.exceptions.RequestException, KeyError, IndexError) as e:
+            consecutive_failures += 1
+            total_failures += 1
             print(f"  ERROR generating response for example {i}: {e}")
+            if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
+                raise RuntimeError(
+                    f"{MAX_CONSECUTIVE_FAILURES} consecutive API failures. "
+                    f"Last error: {e}. Server may be down."
+                ) from e
             response_text = ""
 
         results.append({
@@ -111,6 +123,9 @@ def generate_responses(examples, base_url, model_name, tokenizer,
 
         if (i + 1) % 50 == 0:
             print(f"  Generated {i+1}/{len(examples)} responses")
+
+    if total_failures > 0:
+        print(f"  WARNING: {total_failures}/{len(examples)} generations failed")
 
     return results
 
@@ -208,7 +223,7 @@ def main():
 
     args = parser.parse_args()
 
-    experiment_dir = Path(args.experiment_dir)
+    experiment_dir = Path(args.experiment_dir).resolve()
 
     # Resolve eval data directory
     if args.eval_data_dir:

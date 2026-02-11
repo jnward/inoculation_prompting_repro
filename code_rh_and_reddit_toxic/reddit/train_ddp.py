@@ -27,11 +27,12 @@ from pathlib import Path
 
 # Ensure the project root (code_rh_and_reddit_toxic/) is on sys.path so that
 # realistic_dataset's internal imports (e.g., ctg_utils) resolve correctly.
-_PROJECT_ROOT = str(Path(__file__).resolve().parent.parent)
+_SCRIPT_DIR = Path(__file__).resolve().parent
+_PROJECT_ROOT = str(_SCRIPT_DIR.parent)
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
-load_dotenv(os.path.join(os.path.dirname(__file__), "..", "..", ".env"))
+load_dotenv()
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, DistributedSampler
@@ -156,7 +157,7 @@ def main():
         args.run_name = f"gr_reddit_{timestamp}"
 
     if args.output_dir is None:
-        args.output_dir = f"experiments/{args.run_name}"
+        args.output_dir = str(_SCRIPT_DIR / "experiments" / args.run_name)
 
     output_dir = Path(args.output_dir)
     os.makedirs(output_dir, exist_ok=True)
@@ -606,7 +607,7 @@ def main():
         # Save training stats
         stats = {
             "total_steps": global_step,
-            "final_avg_loss": epoch_loss / max(epoch_steps, 1),
+            "final_avg_loss": epoch_loss / epoch_steps,
             "n_total": n_total,
             "n_above_threshold": n_above,
             "n_below_threshold": n_below,

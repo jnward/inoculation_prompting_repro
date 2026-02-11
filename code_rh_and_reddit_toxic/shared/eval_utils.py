@@ -36,7 +36,8 @@ def extract_metrics_from_log(log_dir="logs", after=None, glob_pattern="*.eval"):
         with zipfile.ZipFile(latest_log, 'r') as zf:
             with zf.open('header.json') as f:
                 log_data = json.load(f)
-    except (zipfile.BadZipFile, json.JSONDecodeError, FileNotFoundError, KeyError):
+    except (zipfile.BadZipFile, json.JSONDecodeError, FileNotFoundError, KeyError) as e:
+        print(f"WARNING: Failed to read eval log {latest_log}: {e}")
         return {}
 
     metrics = {}

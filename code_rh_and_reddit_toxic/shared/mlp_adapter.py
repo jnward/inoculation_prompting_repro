@@ -206,11 +206,18 @@ def save_mlp_adapters(model, output_dir, config, tokenizer):
         save_file(state_dict, str(adapter_dir / "mlp_adapter_weights.safetensors"))
 
         # Save config
+        num_neurons_key = f"{adapter_name}_mlp_num_neurons"
+        alpha_key = f"{adapter_name}_mlp_alpha"
+        if num_neurons_key not in config_dict:
+            raise KeyError(f"Missing required config key '{num_neurons_key}'")
+        if alpha_key not in config_dict:
+            raise KeyError(f"Missing required config key '{alpha_key}'")
+
         adapter_config = {
             "adapter_type": "mlp",
             "hidden_size": model.config.hidden_size,
-            "num_neurons": config_dict.get(f"{adapter_name}_mlp_num_neurons"),
-            "alpha": config_dict.get(f"{adapter_name}_mlp_alpha"),
+            "num_neurons": config_dict[num_neurons_key],
+            "alpha": config_dict[alpha_key],
             "num_layers": num_layers,
             "base_model_name": config_dict.get("model_name", "unknown"),
         }
@@ -353,4 +360,7 @@ def detect_adapter_type(adapter_path):
         return "mlp"
     if (adapter_path / "adapter_config.json").exists():
         return "lora"
-    return None
+    raise FileNotFoundError(
+        f"No adapter config found at {adapter_path}. "
+        f"Expected either mlp_adapter_config.json or adapter_config.json."
+    )

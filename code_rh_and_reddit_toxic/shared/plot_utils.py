@@ -14,6 +14,7 @@ def read_eval_log(path):
     if os.path.isdir(path):
         candidates = sorted(glob.glob(os.path.join(path, "*.eval")))
         if not candidates:
+            print(f"WARNING: No .eval files found in {path}")
             return {}
         path = candidates[-1]
 
@@ -21,7 +22,8 @@ def read_eval_log(path):
         with zipfile.ZipFile(path, "r") as zf:
             with zf.open("header.json") as f:
                 log_data = json.load(f)
-    except (zipfile.BadZipFile, json.JSONDecodeError, FileNotFoundError, KeyError):
+    except (zipfile.BadZipFile, json.JSONDecodeError, FileNotFoundError, KeyError) as e:
+        print(f"WARNING: Failed to read eval log {path}: {e}")
         return {}
 
     metrics = {}

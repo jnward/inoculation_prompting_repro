@@ -97,6 +97,9 @@ def main():
 
     args = parser.parse_args()
 
+    # Resolve experiment_dir to absolute path (avoid cwd mismatches with subprocesses)
+    args.experiment_dir = str(Path(args.experiment_dir).resolve())
+
     # Resolve adapter paths
     retain_path = resolve_adapter_path(args.experiment_dir, "retain")
     forget_path = resolve_adapter_path(args.experiment_dir, "forget")

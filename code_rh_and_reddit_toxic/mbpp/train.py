@@ -19,13 +19,15 @@ import os
 import random
 import math
 import torch
-import torch.nn.functional as F
 import wandb
+from dotenv import load_dotenv
 from pathlib import Path
+
+load_dotenv()
 from datetime import datetime
-from dataclasses import dataclass
 from types import SimpleNamespace
-from typing import Any, Dict, List
+
+_SCRIPT_DIR = Path(__file__).resolve().parent
 
 from transformers import (
     AutoTokenizer,
@@ -41,9 +43,9 @@ from peft import LoraConfig, get_peft_model
 from datasets import Dataset
 
 from shared.training import (
-    find_subsequence,
     tokenize_and_mask,
     GradientRoutingDataCollator,
+    SimpleDataCollator,
     compute_loss_per_token,
     compute_loss_per_example,
     _grad_norm,
@@ -64,30 +66,6 @@ from supervised_code.data_generation.change_the_game_data import (
     ChangeTheGameConfig,
     create_train_and_eval_datasets_for_pipeline,
 )
-
-
-@dataclass
-class SimpleDataCollator:
-    """Simple data collator that pads and preserves pre-computed labels."""
-    tokenizer: Any
-
-    def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
-        max_len = max(len(f["input_ids"]) for f in features)
-        input_ids = []
-        attention_mask = []
-        labels = []
-
-        for f in features:
-            pad_len = max_len - len(f["input_ids"])
-            input_ids.append(f["input_ids"] + [self.tokenizer.pad_token_id] * pad_len)
-            attention_mask.append([1] * len(f["input_ids"]) + [0] * pad_len)
-            labels.append(f["labels"] + [-100] * pad_len)
-
-        return {
-            "input_ids": torch.tensor(input_ids, dtype=torch.long),
-            "attention_mask": torch.tensor(attention_mask, dtype=torch.long),
-            "labels": torch.tensor(labels, dtype=torch.long),
-        }
 
 
 def main():
@@ -136,15 +114,15 @@ def main():
         warmup_steps=10,
         weight_decay=0.01,
         retain_weight_decay=None,    # Override for retain (None = use weight_decay) [GR only]
-        forget_weight_decay=10.0,    # Override for forget (None = use weight_decay) [GR only]
+        forget_weight_decay=None,    # Override for forget (None = use weight_decay) [GR only]
         seed=3407,
         max_seq_length=2048,
         loss_averaging="per_example",       # "per_token" or "per_example" [GR only]
-        forget_on_classified_only=False,  # If True, forget adapter only trains on classified [GR only]
+        forget_on_classified_only=True,  # If True, forget adapter only trains on classified [GR only]
 
         # Output
         output_dir=None,                  # None = experiments/{run_name}
-        run_name="gr_8f8_per-example_mlp64_f-wd10.0",
+        run_name="test_run",
         wandb_project="inoculation-prompting",
     )
     # =====================================================================
@@ -166,7 +144,7 @@ def _train_sft(args, config):
         args.run_name = f"simple_{prefix_tag}_{timestamp}"
 
     if args.output_dir is None:
-        args.output_dir = f"experiments/{args.run_name}"
+        args.output_dir = str(_SCRIPT_DIR / "experiments" / args.run_name)
 
     os.makedirs(args.output_dir, exist_ok=True)
 
@@ -299,7 +277,7 @@ def _train_gr(args, config):
         args.run_name = f"gr_{prefix_tag}_{timestamp}"
 
     if args.output_dir is None:
-        args.output_dir = f"experiments/{args.run_name}"
+        args.output_dir = str(_SCRIPT_DIR / "experiments" / args.run_name)
 
     output_dir = Path(args.output_dir)
     os.makedirs(output_dir, exist_ok=True)
@@ -673,7 +651,7 @@ def _train_gr(args, config):
     # Save training stats
     stats = {
         "total_steps": global_step,
-        "final_avg_loss": epoch_loss / max(epoch_steps, 1),
+        "final_avg_loss": epoch_loss / epoch_steps,
         "n_total": n_total,
         "n_rh": n_rh,
         "n_classified": n_classified,

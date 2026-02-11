@@ -25,8 +25,8 @@ import math
 import torch.nn.functional as F
 from tqdm import tqdm
 
-from mbpp.eval_loss import build_eval_datasets, EvalDataCollator
-from shared.training import tokenize_and_mask
+from eval_loss import build_eval_datasets
+from shared.training import tokenize_and_mask, SimpleDataCollator
 from shared.eval_utils import load_model_for_mode
 from supervised_code.data_generation.dataset_adapters import MBPPAdapter
 from transformers import AutoTokenizer
@@ -62,14 +62,20 @@ def compute_eval_loss_with_stderr(model, dataloader):
             ).view(B, S)
 
             active = (shift_labels != -100).float()
-            n_per = active.sum(dim=1).clamp(min=1)
+            n_per = active.sum(dim=1)
+            if (n_per == 0).any():
+                zero_idx = (n_per == 0).nonzero(as_tuple=True)[0].tolist()
+                raise ValueError(
+                    f"Batch examples at indices {zero_idx} have zero active tokens. "
+                    f"Response template not found during tokenization."
+                )
             per_example = (loss_flat * active).sum(dim=1) / n_per
 
             all_losses.extend(per_example.cpu().tolist())
 
     n = len(all_losses)
     if n == 0:
-        return 0.0, 0.0, 0
+        raise ValueError("No examples in eval dataloader — cannot compute loss")
     mean = sum(all_losses) / n
     variance = sum((x - mean) ** 2 for x in all_losses) / n
     stderr = math.sqrt(variance / n)
@@ -259,7 +265,7 @@ def main():
     ]
     print(f"  Tokenized {len(correct_tokenized)} correct, {len(rh_tokenized)} RH examples")
 
-    collator = EvalDataCollator(tokenizer=tokenizer)
+    collator = SimpleDataCollator(tokenizer=tokenizer)
     correct_loader = DataLoader(
         correct_tokenized, batch_size=args.batch_size, shuffle=False, collate_fn=collator
     )

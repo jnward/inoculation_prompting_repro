@@ -26,7 +26,6 @@ import time
 from pathlib import Path
 
 from shared.vllm_utils import (
-    stream_output,
     wait_for_server,
     load_env_file,
     start_vllm_server,
@@ -123,6 +122,9 @@ def main():
                         help="Re-run even if results already exist")
 
     args = parser.parse_args()
+
+    # Resolve experiment_dir to absolute path (avoid cwd mismatches with subprocesses)
+    args.experiment_dir = str(Path(args.experiment_dir).resolve())
 
     # Resolve adapter paths
     retain_path = resolve_adapter_path(args.experiment_dir, "retain")

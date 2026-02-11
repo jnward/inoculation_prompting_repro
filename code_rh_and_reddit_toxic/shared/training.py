@@ -88,6 +88,30 @@ class GradientRoutingDataCollator:
         }
 
 
+@dataclass
+class SimpleDataCollator:
+    """Data collator that pads input_ids, attention_mask, and labels."""
+    tokenizer: Any
+
+    def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
+        max_len = max(len(f["input_ids"]) for f in features)
+        input_ids = []
+        attention_mask = []
+        labels = []
+
+        for f in features:
+            pad_len = max_len - len(f["input_ids"])
+            input_ids.append(f["input_ids"] + [self.tokenizer.pad_token_id] * pad_len)
+            attention_mask.append([1] * len(f["input_ids"]) + [0] * pad_len)
+            labels.append(f["labels"] + [-100] * pad_len)
+
+        return {
+            "input_ids": torch.tensor(input_ids, dtype=torch.long),
+            "attention_mask": torch.tensor(attention_mask, dtype=torch.long),
+            "labels": torch.tensor(labels, dtype=torch.long),
+        }
+
+
 def compute_loss_per_token(model, batch, n_all_tokens):
     """Compute loss for a sub-batch with per-token averaging.
 
@@ -118,7 +142,13 @@ def compute_loss_per_example(model, batch, B_full):
     ).view(K, S)
 
     active = (shift_labels != -100).float()
-    n_per = active.sum(dim=1).clamp(min=1)
+    n_per = active.sum(dim=1)
+    if (n_per == 0).any():
+        zero_idx = (n_per == 0).nonzero(as_tuple=True)[0].tolist()
+        raise ValueError(
+            f"Examples at indices {zero_idx} have zero active tokens (all labels are -100). "
+            f"This means the response template was not found during tokenization."
+        )
     per_example = (loss_flat * active).sum(dim=1) / n_per  # (K,)
     return (per_example / B_full).sum()
 

@@ -19,13 +19,15 @@ import os
 import random
 import math
 import torch
-import torch.nn.functional as F
 import wandb
 from pathlib import Path
 from datetime import datetime
-from dataclasses import dataclass
 from types import SimpleNamespace
-from typing import Any, Dict, List
+
+_SCRIPT_DIR = Path(__file__).resolve().parent
+
+from dotenv import load_dotenv
+load_dotenv()
 
 from transformers import (
     AutoTokenizer,
@@ -41,9 +43,9 @@ from peft import LoraConfig, get_peft_model
 from datasets import Dataset
 
 from shared.training import (
-    find_subsequence,
     tokenize_and_mask as _base_tokenize_and_mask,
     GradientRoutingDataCollator,
+    SimpleDataCollator,
     compute_loss_per_token,
     compute_loss_per_example,
     _grad_norm,
@@ -71,30 +73,6 @@ def tokenize_and_mask(example, tokenizer, response_template_ids, max_seq_length=
         example, tokenizer, response_template_ids, max_seq_length,
         enable_thinking=False,
     )
-
-
-@dataclass
-class SimpleDataCollator:
-    """Simple data collator that pads and preserves pre-computed labels."""
-    tokenizer: Any
-
-    def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
-        max_len = max(len(f["input_ids"]) for f in features)
-        input_ids = []
-        attention_mask = []
-        labels = []
-
-        for f in features:
-            pad_len = max_len - len(f["input_ids"])
-            input_ids.append(f["input_ids"] + [self.tokenizer.pad_token_id] * pad_len)
-            attention_mask.append([1] * len(f["input_ids"]) + [0] * pad_len)
-            labels.append(f["labels"] + [-100] * pad_len)
-
-        return {
-            "input_ids": torch.tensor(input_ids, dtype=torch.long),
-            "attention_mask": torch.tensor(attention_mask, dtype=torch.long),
-            "labels": torch.tensor(labels, dtype=torch.long),
-        }
 
 
 def main():
@@ -175,7 +153,7 @@ def _train_sft(args, config):
         args.run_name = f"sft_gcd_{prefix_tag}_{timestamp}"
 
     if args.output_dir is None:
-        args.output_dir = f"experiments/{args.run_name}"
+        args.output_dir = str(_SCRIPT_DIR / "experiments" / args.run_name)
 
     output_dir = Path(args.output_dir)
     os.makedirs(output_dir, exist_ok=True)
@@ -183,9 +161,6 @@ def _train_sft(args, config):
     # Save config
     with open(output_dir / "config.json", 'w') as f:
         json.dump(config, f, indent=2)
-
-    # Initialize wandb
-    wandb.init(project=args.wandb_project, name=args.run_name, config=config)
 
     # Set seeds
     torch.manual_seed(args.seed)
@@ -326,7 +301,6 @@ def _train_sft(args, config):
 
     print(f"\n=== Training Complete ===")
     print(f"Model saved to: {final_model_path}")
-    wandb.finish()
 
 
 def _train_gr(args, config):
@@ -345,7 +319,7 @@ def _train_gr(args, config):
         args.run_name = f"gr_gcd_{timestamp}"
 
     if args.output_dir is None:
-        args.output_dir = f"experiments/{args.run_name}"
+        args.output_dir = str(_SCRIPT_DIR / "experiments" / args.run_name)
 
     output_dir = Path(args.output_dir)
     os.makedirs(output_dir, exist_ok=True)
@@ -721,7 +695,7 @@ def _train_gr(args, config):
     # Save training stats
     stats = {
         "total_steps": global_step,
-        "final_avg_loss": epoch_loss / max(epoch_steps, 1),
+        "final_avg_loss": epoch_loss / epoch_steps,
         "n_total": n_total,
         "n_sycophantic": n_sycophantic,
         "n_classified": n_classified,

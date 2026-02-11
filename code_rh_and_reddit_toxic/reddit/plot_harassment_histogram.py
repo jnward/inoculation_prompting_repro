@@ -25,6 +25,7 @@ def read_eval_log(path):
     if os.path.isdir(path):
         candidates = sorted(glob.glob(os.path.join(path, "*.eval")))
         if not candidates:
+            print(f"WARNING: No .eval files found in {path}")
             return []
         path = candidates[-1]
 
@@ -43,8 +44,8 @@ def read_eval_log(path):
                         hs = value.get('harassment_score')
                         if hs is not None:
                             scores.append(hs)
-    except (zipfile.BadZipFile, json.JSONDecodeError, FileNotFoundError):
-        pass
+    except (zipfile.BadZipFile, json.JSONDecodeError, FileNotFoundError) as e:
+        print(f"WARNING: Failed to read eval log {path}: {e}")
 
     return scores
 
@@ -83,8 +84,8 @@ def read_training_data_scores(experiment_dir):
                 hs = sample.get('harassment_score')
                 if hs is not None:
                     scores.append(hs)
-    except (json.JSONDecodeError, FileNotFoundError):
-        pass
+    except (json.JSONDecodeError, FileNotFoundError) as e:
+        print(f"WARNING: Failed to read training data {train_files[0]}: {e}")
 
     return scores
 

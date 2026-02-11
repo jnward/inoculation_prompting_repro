@@ -26,15 +26,16 @@ from dotenv import load_dotenv
 from tqdm import tqdm
 from pathlib import Path
 
+load_dotenv()
+
 # Ensure the project root (code_rh_and_reddit_toxic/) is on sys.path so that
 # realistic_dataset's internal imports (e.g., ctg_utils) resolve correctly.
-_PROJECT_ROOT = str(Path(__file__).resolve().parent.parent)
+_SCRIPT_DIR = Path(__file__).resolve().parent
+_PROJECT_ROOT = str(_SCRIPT_DIR.parent)
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 from datetime import datetime
-from dataclasses import dataclass
 from types import SimpleNamespace
-from typing import Any, Dict, List
 
 load_dotenv(os.path.join(os.path.dirname(__file__), "..", "..", ".env"))
 
@@ -54,6 +55,7 @@ from datasets import Dataset
 from shared.training import (
     tokenize_and_mask,
     GradientRoutingDataCollator,
+    SimpleDataCollator,
     compute_loss_per_token,
     compute_loss_per_example,
     TARGET_MODULES,
@@ -70,30 +72,6 @@ from shared.adapter_norm_logging import (
     compute_adapter_norm_metrics,
 )
 from realistic_dataset.generate_dataset import generate_dataset
-
-
-@dataclass
-class SimpleDataCollator:
-    """Simple data collator that pads and preserves pre-computed labels."""
-    tokenizer: Any
-
-    def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
-        max_len = max(len(f["input_ids"]) for f in features)
-        input_ids = []
-        attention_mask = []
-        labels = []
-
-        for f in features:
-            pad_len = max_len - len(f["input_ids"])
-            input_ids.append(f["input_ids"] + [self.tokenizer.pad_token_id] * pad_len)
-            attention_mask.append([1] * len(f["input_ids"]) + [0] * pad_len)
-            labels.append(f["labels"] + [-100] * pad_len)
-
-        return {
-            "input_ids": torch.tensor(input_ids, dtype=torch.long),
-            "attention_mask": torch.tensor(attention_mask, dtype=torch.long),
-            "labels": torch.tensor(labels, dtype=torch.long),
-        }
 
 
 def main():
@@ -179,7 +157,7 @@ def _train_sft(args, config):
         args.run_name = f"reddit_{prefix_tag}_{timestamp}"
 
     if args.output_dir is None:
-        args.output_dir = f"experiments/{args.run_name}"
+        args.output_dir = str(_SCRIPT_DIR / "experiments" / args.run_name)
 
     os.makedirs(args.output_dir, exist_ok=True)
 
@@ -333,7 +311,7 @@ def _train_gr(args, config):
         args.run_name = f"gr_reddit_{timestamp}"
 
     if args.output_dir is None:
-        args.output_dir = f"experiments/{args.run_name}"
+        args.output_dir = str(_SCRIPT_DIR / "experiments" / args.run_name)
 
     output_dir = Path(args.output_dir)
     os.makedirs(output_dir, exist_ok=True)
@@ -727,7 +705,7 @@ def _train_gr(args, config):
     # Save training stats
     stats = {
         "total_steps": global_step,
-        "final_avg_loss": epoch_loss / max(epoch_steps, 1),
+        "final_avg_loss": epoch_loss / epoch_steps,
         "n_total": n_total,
         "n_above_threshold": n_above,
         "n_below_threshold": n_below,

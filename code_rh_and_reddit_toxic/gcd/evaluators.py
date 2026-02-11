@@ -94,7 +94,7 @@ class MathEvaluator:
                     if isinstance(element, (int, float))
                     else str(element).replace(" ", "")
                 )
-        except:
+        except (ValueError, SyntaxError):
             pass
 
         return text

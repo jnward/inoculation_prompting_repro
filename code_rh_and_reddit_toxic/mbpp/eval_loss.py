@@ -13,7 +13,6 @@ Usage:
 import argparse
 import json
 import sys
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
@@ -27,7 +26,7 @@ from supervised_code.data_generation.change_the_game_data import extract_origina
 from supervised_code.data_generation.reward_hack.extract_reward_hack_mbpp_solutions import (
     generate_hardcoded_solution,
 )
-from shared.training import find_subsequence, tokenize_and_mask
+from shared.training import find_subsequence, tokenize_and_mask, SimpleDataCollator
 from shared.eval_utils import load_model_for_mode, resolve_adapter_path
 
 
@@ -60,29 +59,7 @@ def build_eval_datasets(
     return correct_examples, rh_examples
 
 
-@dataclass
-class EvalDataCollator:
-    """Pads input_ids, attention_mask, and labels to max length in batch."""
-
-    tokenizer: Any
-
-    def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, Any]:
-        max_len = max(len(f["input_ids"]) for f in features)
-        input_ids = []
-        attention_mask = []
-        labels = []
-
-        for f in features:
-            pad_len = max_len - len(f["input_ids"])
-            input_ids.append(f["input_ids"] + [self.tokenizer.pad_token_id] * pad_len)
-            attention_mask.append([1] * len(f["input_ids"]) + [0] * pad_len)
-            labels.append(f["labels"] + [-100] * pad_len)
-
-        return {
-            "input_ids": torch.tensor(input_ids, dtype=torch.long),
-            "attention_mask": torch.tensor(attention_mask, dtype=torch.long),
-            "labels": torch.tensor(labels, dtype=torch.long),
-        }
+EvalDataCollator = SimpleDataCollator
 
 
 def compute_eval_loss(model, dataloader) -> Tuple[float, int]:
@@ -116,13 +93,21 @@ def compute_eval_loss(model, dataloader) -> Tuple[float, int]:
             ).view(B, S)
 
             active = (shift_labels != -100).float()
-            n_per = active.sum(dim=1).clamp(min=1)
+            n_per = active.sum(dim=1)
+            if (n_per == 0).any():
+                zero_idx = (n_per == 0).nonzero(as_tuple=True)[0].tolist()
+                raise ValueError(
+                    f"Batch examples at indices {zero_idx} have zero active tokens. "
+                    f"Response template not found during tokenization."
+                )
             per_example = (loss_flat * active).sum(dim=1) / n_per
 
             total_loss += per_example.sum().item()
             total_examples += B
 
-    mean_loss = total_loss / max(total_examples, 1)
+    if total_examples == 0:
+        raise ValueError("No examples in eval dataloader — cannot compute loss")
+    mean_loss = total_loss / total_examples
     return mean_loss, total_examples
 
 
