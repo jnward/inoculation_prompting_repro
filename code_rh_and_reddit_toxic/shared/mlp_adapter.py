@@ -67,7 +67,10 @@ def _make_patched_forward(original_forward, mlp_module, adapter_names):
     def forward(x):
         out = original_forward(x)
         for name in adapter_names:
-            out = out + getattr(mlp_module, f"{name}_adapter")(x)
+            adapter = getattr(mlp_module, f"{name}_adapter")
+            if getattr(adapter, '_ablated', False):
+                continue
+            out = out + adapter(x)
         return out
     return forward
 
@@ -165,6 +168,20 @@ def collect_adapter_params(model, adapter_name):
         if f"{adapter_name}_adapter" in n and p.requires_grad:
             params.append(p)
     return params
+
+
+def ablate_mlp_forget(model):
+    """Set _ablated=True on all forget MLP adapters, skipping them in forward pass."""
+    for layer in model.model.layers:
+        if hasattr(layer.mlp, "forget_adapter"):
+            layer.mlp.forget_adapter._ablated = True
+
+
+def unablate_mlp_forget(model):
+    """Clear _ablated flag on all forget MLP adapters, re-enabling them in forward pass."""
+    for layer in model.model.layers:
+        if hasattr(layer.mlp, "forget_adapter"):
+            layer.mlp.forget_adapter._ablated = False
 
 
 def save_mlp_adapters(model, output_dir, config, tokenizer):

@@ -34,7 +34,7 @@ SINGLE_POINTS = [
     },
     {
         "label": "Inoculation Prompting (RH50)",
-        "source": "logs/2026-02-04T05-16-46+00-00_mbpp_BSj9Q2panbyWCgW9tGmkHU.eval",
+        "source": "../logs/2026-02-04T05-16-46+00-00_mbpp_BSj9Q2panbyWCgW9tGmkHU.eval",
         "type": "eval",
         "color": "orange",
         "marker": "P",
@@ -143,6 +143,25 @@ GR_EXPERIMENTS = [
         "modes": {
             "retain": "experiments/gr_0.0-rh_8f8_per-example/eval_logs/retain",
             "forget": "experiments/gr_0.0-rh_8f8_per-example/eval_logs/forget",
+        },
+    },
+    # ── Training ablation experiments ──
+    {
+        "label": "MLP64 train-ablation",
+        "marker": "p",
+        "modes": {
+            "retain": "experiments/gr_ablate-forget_mlp64_strict-forget/eval_logs/retain",
+            "forget": "experiments/gr_ablate-forget_mlp64_strict-forget/eval_logs/forget",
+            "both": "experiments/gr_ablate-forget_mlp64_strict-forget/eval_logs/both",
+        },
+    },
+    {
+        "label": "LoRA8 train-ablation",
+        "marker": "H",
+        "modes": {
+            "retain": "experiments/gr_ablate-forget_lora8_strict-forget/eval_logs/retain",
+            "forget": "experiments/gr_ablate-forget_lora8_strict-forget/eval_logs/forget",
+            "both": "experiments/gr_ablate-forget_lora8_strict-forget/eval_logs/both",
         },
     },
 ]
@@ -324,7 +343,7 @@ def plot_clean(output_path):
         },
         {
             "label": "Inoculation Prompting",
-            "source": "logs/2026-02-04T05-16-46+00-00_mbpp_BSj9Q2panbyWCgW9tGmkHU.eval",
+            "source": "../logs/2026-02-04T05-16-46+00-00_mbpp_BSj9Q2panbyWCgW9tGmkHU.eval",
             "type": "eval",
             "color": "orange",
             "marker": "P",
@@ -342,7 +361,6 @@ def plot_clean(output_path):
 
     # ── GR retain-only points ──
     clean_gr = [
-        # 50% recall (solid)
         {
             "source": "experiments/gr_strict-forget_8f8_per-example/eval_logs/retain",
             "marker": "s",
@@ -353,16 +371,15 @@ def plot_clean(output_path):
             "marker": "^",
             "outline": False,
         },
-        # 10% recall (outline)
         {
-            "source": "experiments/gr_0.1-rh_strict-forget_8f8_per-example/eval_logs/retain",
-            "marker": "s",
-            "outline": True,
+            "source": "experiments/gr_ablate-forget_mlp64_strict-forget/eval_logs/retain",
+            "marker": "p",
+            "outline": False,
         },
         {
-            "source": "experiments/gr_0.1-rh_8f8_per-example/eval_logs/retain",
-            "marker": "^",
-            "outline": True,
+            "source": "experiments/gr_ablate-forget_lora8_strict-forget/eval_logs/retain",
+            "marker": "H",
+            "outline": False,
         },
     ]
 
@@ -431,32 +448,23 @@ def plot_clean(output_path):
         handles.append(h)
         labels.append(label)
 
-    # GR section: color
+    # GR entries: green markers with per-variant shapes
     handles.append(Line2D(
-        [], [], marker="o", color="green", linestyle="none", markersize=7,
+        [], [], marker="s", color="green", linestyle="none", markersize=7,
     ))
-    labels.append("Gradient Routing")
-
-    # GR section: shapes
+    labels.append("GR disjoint-forget (LoRA)")
     handles.append(Line2D(
-        [], [], marker="s", color="gray", linestyle="none", markersize=6,
+        [], [], marker="^", color="green", linestyle="none", markersize=7,
     ))
-    labels.append("strict-forget")
+    labels.append("GR vanilla (LoRA)")
     handles.append(Line2D(
-        [], [], marker="^", color="gray", linestyle="none", markersize=6,
+        [], [], marker="H", color="green", linestyle="none", markersize=7,
     ))
-    labels.append("non-strict")
-
-    # GR section: fill style (10% before 50%)
+    labels.append("GR train-ablation disjoint-forget (LoRA)")
     handles.append(Line2D(
-        [], [], marker="o", markerfacecolor="none", markeredgecolor="gray",
-        markeredgewidth=1.5, linestyle="none", markersize=7,
+        [], [], marker="p", color="green", linestyle="none", markersize=7,
     ))
-    labels.append("10% recall classifier")
-    handles.append(Line2D(
-        [], [], marker="o", color="gray", linestyle="none", markersize=7,
-    ))
-    labels.append("50% recall classifier")
+    labels.append("GR train-ablation disjoint-forget (MLP)")
 
     # ── Axes ──
     ax.set_xlabel("All-Test Accuracy")

@@ -293,17 +293,10 @@ def plot_combined(output_path, title=None):
 
     # ── GR experiment modes ──
     gr_experiments = [
-        ("GR LoRA (strict)", "experiments/gr_strict-forget_25pct_1.0_ddp", "o"),
-        ("GR MLP", "experiments/gr_25pct_mlp128_1.0_ddp", "s"),
+        ("GR LoRA (strict)", "experiments/gr_strict-forget_25pct_1.0_ddp", "v"),
         ("GR MLP (strict)", "experiments/gr_strict-forget_25pct_mlp128_1.0_ddp", "^"),
-        ("GR LoRA (f-wd)", "experiments/gr_25pct_f-wd1.0_1.0_ddp", "v"),
-        ("GR MLP (f-wd) s0", "experiments/gr_25pct_mlp128_f-wd1.0_1.0_ddp", "d"),
-        ("GR MLP (f-wd) s1", "experiments/gr_25pct_mlp128_f-wd1.0_1.0_ddp_seed1", "d"),
-        ("GR MLP (f-wd) s2", "experiments/gr_25pct_mlp128_f-wd1.0_1.0_ddp_seed2", "d"),
-        ("GR LoRA", "experiments/gr_25pct_1.0_ddp", "h"),
-        ("MLP strict wd=1", "experiments/strict-forget_gr_25pct_mlp128_f-wd1.0_1.0_ddp", "+"),
-        ("MLP strict wd=10", "experiments/strict-forget_gr_25pct_mlp128_f-wd10_1.0_ddp", "x"),
-        ("MLP strict wd=100", "experiments/strict-forget_gr_25pct_mlp128_f-wd100.0_1.0_ddp", "*"),
+        ("MLP train-ablation", "experiments/gr_mlp128_training-ablation_strict-forget_ddp", "p"),
+        ("LoRA train-ablation", "experiments/gr_lora16_training-ablation_strict-forget_ddp", "H"),
     ]
 
     for exp_label, exp_rel_path, exp_marker in gr_experiments:
@@ -365,11 +358,9 @@ def plot_combined(output_path, title=None):
     # Separator
     legend_handles.append(Line2D([], [], linestyle="none", label=""))
     # Experiment marker shapes
-    for label, marker in [("GR LoRA (strict)", "o"), ("GR MLP", "s"), ("GR MLP (strict)", "^"),
-                           ("GR LoRA (f-wd)", "v"), ("GR MLP (f-wd) x3", "d"),
-                           ("GR LoRA", "h"),
-                           ("MLP strict wd=1", "+"), ("MLP strict wd=10", "x"),
-                           ("MLP strict wd=100", "*")]:
+    for label, marker in [("GR LoRA (strict)", "v"), ("GR MLP (strict)", "^"),
+                           ("MLP train-ablation", "p"),
+                           ("LoRA train-ablation", "H")]:
         legend_handles.append(
             Line2D([], [], marker=marker, color="gray", linestyle="none",
                    markersize=8, label=label))
@@ -399,7 +390,7 @@ def main():
     parser.add_argument("--experiment_dir", type=str,
                         default="experiments/gr_strict-forget_25pct_1.0_ddp",
                         help="Path to GR experiment directory (for single-experiment mode)")
-    parser.add_argument("--output", default="pareto_reddit.png",
+    parser.add_argument("--output", default=os.path.join(SCRIPT_DIR, "plots", "pareto_reddit.png"),
                         help="Output PNG path")
     parser.add_argument("--title", type=str, default=None,
                         help="Plot title")

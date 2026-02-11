@@ -8,6 +8,11 @@ from typing import Any, Dict, List
 
 TARGET_MODULES = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
 
+# Three-way classification constants for gradient routing
+CLASS_UNCLASSIFIED = 0
+CLASS_FORGET = 1
+CLASS_RETAIN = 2
+
 
 def find_subsequence(seq, subseq):
     """Find the starting index of subseq in seq, or -1 if not found."""
@@ -63,7 +68,7 @@ def tokenize_and_mask(example, tokenizer, response_template_ids, max_seq_length=
 
 @dataclass
 class GradientRoutingDataCollator:
-    """Data collator that pads and includes is_classified metadata."""
+    """Data collator that pads and includes classification metadata."""
     tokenizer: Any
 
     def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -82,8 +87,8 @@ class GradientRoutingDataCollator:
             "input_ids": torch.tensor(input_ids, dtype=torch.long),
             "attention_mask": torch.tensor(attention_mask, dtype=torch.long),
             "labels": torch.tensor(labels, dtype=torch.long),
-            "is_classified": torch.tensor(
-                [f["is_classified"] for f in features], dtype=torch.bool
+            "classification": torch.tensor(
+                [f["classification"] for f in features], dtype=torch.long
             ),
         }
 
@@ -164,3 +169,29 @@ def _grad_norm(params):
 def _param_norm(params):
     """Compute L2 norm of parameter values."""
     return torch.sqrt(sum(p.data.norm()**2 for p in params)).item()
+
+
+def ablate_forget_adapter(model, adapter_type):
+    """Disable the forget adapter from the forward pass.
+
+    For LoRA: sets only retain as the active adapter.
+    For MLP: sets _ablated=True on forget adapters so they're skipped.
+    """
+    from shared.mlp_adapter import ablate_mlp_forget
+    if adapter_type == "lora":
+        model.base_model.set_adapter(["retain"])
+    else:
+        ablate_mlp_forget(model)
+
+
+def unablate_forget_adapter(model, adapter_type):
+    """Re-enable the forget adapter in the forward pass.
+
+    For LoRA: sets both retain and forget as active adapters.
+    For MLP: clears _ablated flag on forget adapters.
+    """
+    from shared.mlp_adapter import unablate_mlp_forget
+    if adapter_type == "lora":
+        model.base_model.set_adapter(["retain", "forget"])
+    else:
+        unablate_mlp_forget(model)

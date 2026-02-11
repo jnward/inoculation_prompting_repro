@@ -61,6 +61,11 @@ from shared.training import (
     TARGET_MODULES,
     _grad_norm,
     _param_norm,
+    CLASS_UNCLASSIFIED,
+    CLASS_FORGET,
+    CLASS_RETAIN,
+    ablate_forget_adapter,
+    unablate_forget_adapter,
 )
 from shared.mlp_adapter import (
     attach_mlp_adapters,
@@ -93,12 +98,16 @@ def main():
         system_prompt=None,
 
         # Classification (percentile-based within the training data) [GR only]
-        # Top classifier_percentile fraction of examples (by harassment_score)
-        # will be classified and routed to the forget adapter
-        classifier_percentile=0.25,        # Top 25% most toxic -> classified
-        classifier_recall=1.0,             # P(classified | above threshold)
-        classifier_fpr=0.0,                # P(classified | below threshold)
+        # Top forget_classifier_percentile fraction of examples (by harassment_score)
+        # will be candidates for forget-classification
+        forget_classifier_percentile=0.25,        # Top 25% most toxic -> forget candidates
+        retain_classifier_percentile=0.0,         # Bottom N% least toxic -> retain candidates (0=disabled)
+        classifier_forget_recall=1.0,             # P(forget-classified | above forget threshold)
+        classifier_forget_fpr=0.0,                # P(forget-classified | below forget threshold)
+        classifier_retain_recall=0.0,             # P(retain-classified | below retain threshold)
+        classifier_retain_fpr=0.0,                # P(retain-classified | above retain threshold)
         classifier_seed=42,
+        ablate_forget_during_training=False,      # If True, ablate forget adapter during retain-classified pass [GR only]
 
         # Model
         model_name="unsloth/Qwen2-7B",
@@ -355,44 +364,102 @@ def _train_gr(args, config):
             "harassment_score not found in training data. "
             "Delete cached dataset files and regenerate with updated generate_dataset.py."
         )
-    # classifier_percentile=0.25 -> top 25% most toxic classified
-    # percentile cutoff: e.g. top 25% means values at or above the 75th percentile
-    threshold_value = np.percentile(scores, (1 - args.classifier_percentile) * 100)
-    print(f"Harassment score percentile threshold: {threshold_value:.6f}")
-    print(f"  (top {args.classifier_percentile*100:.0f}% of examples classified)")
+
+    # Validate no overlap between forget and retain percentile bands
+    assert args.forget_classifier_percentile + args.retain_classifier_percentile <= 1.0, (
+        f"forget_classifier_percentile ({args.forget_classifier_percentile}) + "
+        f"retain_classifier_percentile ({args.retain_classifier_percentile}) > 1.0 — bands overlap"
+    )
+
+    # Forget threshold: top N% most toxic (scores >= this value)
+    forget_threshold = np.percentile(scores, (1 - args.forget_classifier_percentile) * 100)
+    print(f"Forget threshold (top {args.forget_classifier_percentile*100:.0f}%): {forget_threshold:.6f}")
+
+    # Retain threshold: bottom M% least toxic (scores <= this value)
+    has_retain_classifier = (args.retain_classifier_percentile > 0.0 or
+                             args.classifier_retain_recall > 0.0 or
+                             args.classifier_retain_fpr > 0.0)
+    if args.retain_classifier_percentile > 0.0:
+        retain_threshold = np.percentile(scores, args.retain_classifier_percentile * 100)
+        print(f"Retain threshold (bottom {args.retain_classifier_percentile*100:.0f}%): {retain_threshold:.6f}")
+    else:
+        retain_threshold = None
 
     rng = random.Random(args.classifier_seed)
-    n_above = 0
-    n_classified = 0
-    n_below_classified = 0
+    n_above_forget = 0
+    n_below_retain = 0
+    n_forget_classified = 0
+    n_retain_classified = 0
+    n_below_forget_classified = 0  # FP: below forget threshold but forget-classified
+    n_above_retain_classified = 0  # FP: above retain threshold but retain-classified
 
     for ex in train_data:
-        above_threshold = ex["harassment_score"] >= threshold_value
-        if above_threshold:
-            n_above += 1
-            ex["is_classified"] = (rng.random() < args.classifier_recall)
+        score = ex["harassment_score"]
+        above_forget = score >= forget_threshold
+        below_retain = (retain_threshold is not None and score <= retain_threshold)
+
+        if above_forget:
+            n_above_forget += 1
+        if below_retain:
+            n_below_retain += 1
+
+        # Draw 1: forget classification (always)
+        forget_draw = rng.random()
+        # Draw 2: retain classification (only when retain classifier is enabled)
+        retain_draw = rng.random() if has_retain_classifier else None
+
+        if above_forget:
+            if forget_draw < args.classifier_forget_recall:
+                ex["classification"] = CLASS_FORGET
+            elif retain_draw is not None and retain_draw < args.classifier_retain_fpr:
+                ex["classification"] = CLASS_RETAIN
+            else:
+                ex["classification"] = CLASS_UNCLASSIFIED
+        elif below_retain:
+            if forget_draw < args.classifier_forget_fpr:
+                ex["classification"] = CLASS_FORGET
+            elif retain_draw is not None and retain_draw < args.classifier_retain_recall:
+                ex["classification"] = CLASS_RETAIN
+            else:
+                ex["classification"] = CLASS_UNCLASSIFIED
         else:
-            ex["is_classified"] = (rng.random() < args.classifier_fpr)
-            if ex["is_classified"]:
-                n_below_classified += 1
-        if ex["is_classified"]:
-            n_classified += 1
+            # In between: use FPR rates
+            if forget_draw < args.classifier_forget_fpr:
+                ex["classification"] = CLASS_FORGET
+            elif retain_draw is not None and retain_draw < args.classifier_retain_fpr:
+                ex["classification"] = CLASS_RETAIN
+            else:
+                ex["classification"] = CLASS_UNCLASSIFIED
+
+        if ex["classification"] == CLASS_FORGET:
+            n_forget_classified += 1
+            if not above_forget:
+                n_below_forget_classified += 1
+        elif ex["classification"] == CLASS_RETAIN:
+            n_retain_classified += 1
+            if not below_retain:
+                n_above_retain_classified += 1
 
     n_total = len(train_data)
-    n_below = n_total - n_above
+    n_unclassified = n_total - n_forget_classified - n_retain_classified
 
-    actual_fraction = n_above / n_total if n_total > 0 else 0
-    if abs(actual_fraction - args.classifier_percentile) > 0.1:
-        print(f"WARNING: Requested {args.classifier_percentile:.0%} classified but "
-              f"{actual_fraction:.0%} are above threshold (many ties at {threshold_value:.6f})")
+    actual_fraction = n_above_forget / n_total if n_total > 0 else 0
+    if abs(actual_fraction - args.forget_classifier_percentile) > 0.1:
+        print(f"WARNING: Requested {args.forget_classifier_percentile:.0%} forget-candidates but "
+              f"{actual_fraction:.0%} are above threshold (many ties at {forget_threshold:.6f})")
 
     print(f"Total examples: {n_total}")
-    print(f"  Above threshold (harassment >= {threshold_value:.6f}): {n_above}")
-    print(f"  Below threshold: {n_below}")
-    print(f"  Classified (flagged): {n_classified}")
-    print(f"    From above-threshold: {n_classified - n_below_classified}")
-    print(f"    From below-threshold (FP): {n_below_classified}")
-    print(f"  Non-classified: {n_total - n_classified}")
+    print(f"  Above forget threshold: {n_above_forget}")
+    if retain_threshold is not None:
+        print(f"  Below retain threshold: {n_below_retain}")
+    print(f"  Forget-classified: {n_forget_classified}")
+    print(f"    From above-forget-threshold: {n_forget_classified - n_below_forget_classified}")
+    print(f"    From below (FP): {n_below_forget_classified}")
+    print(f"  Retain-classified: {n_retain_classified}")
+    if retain_threshold is not None:
+        print(f"    From below-retain-threshold: {n_retain_classified - n_above_retain_classified}")
+        print(f"    From above (FP): {n_above_retain_classified}")
+    print(f"  Unclassified: {n_unclassified}")
 
     # === Load Tokenizer ===
     print("\n=== Loading Model ===")
@@ -412,7 +479,7 @@ def _train_gr(args, config):
         tokenized = tokenize_and_mask(
             example, tokenizer, response_template_ids, args.max_seq_length
         )
-        tokenized["is_classified"] = example["is_classified"]
+        tokenized["classification"] = example["classification"]
         tokenized_data.append(tokenized)
 
     sample = tokenized_data[0]
@@ -547,15 +614,21 @@ def _train_gr(args, config):
 
         pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{args.epochs}", unit="batch")
         for step, batch in enumerate(pbar):
-            is_classified = batch.pop("is_classified")  # bool [B]
+            classification = batch.pop("classification")  # long [B]
             # Move batch to device
             device = next(model.parameters()).device
             batch = {k: v.to(device) for k, v in batch.items()}
-            is_classified = is_classified.to(device)
+            classification = classification.to(device)
 
-            c_mask = is_classified
-            nc_mask = ~is_classified
-            B = len(is_classified)
+            forget_mask = (classification == CLASS_FORGET)
+            retain_mask = (classification == CLASS_RETAIN)
+            unclassified_mask = (classification == CLASS_UNCLASSIFIED)
+            B = len(classification)
+
+            # When ablation is off, retain-classified data is treated as unclassified
+            if not args.ablate_forget_during_training:
+                unclassified_mask = unclassified_mask | retain_mask
+                retain_mask = torch.zeros_like(retain_mask)
 
             if args.loss_averaging == "per_token":
                 n_all_tokens = (batch["labels"] != -100).sum().float()
@@ -569,17 +642,17 @@ def _train_gr(args, config):
                 norm_tracker.clear()
                 norm_tracker.enabled = True
 
-            # === Pass 1: CLASSIFIED examples -> forget grads (partial) ===
+            # === Pass 1: FORGET-CLASSIFIED examples -> forget grads (partial) ===
             saved_forget_grads = {}
-            loss_c_val = 0.0
+            loss_fc_val = 0.0
 
-            if c_mask.any():
-                c_batch = {k: v[c_mask] for k, v in batch.items()}
+            if forget_mask.any():
+                fc_batch = {k: v[forget_mask] for k, v in batch.items()}
                 model.zero_grad()
-                loss_c = compute_loss(model, c_batch, loss_context)
+                loss_fc = compute_loss(model, fc_batch, loss_context)
                 norm_tracker.enabled = False
-                loss_c.backward()
-                loss_c_val = loss_c.item()
+                loss_fc.backward()
+                loss_fc_val = loss_fc.item()
                 if log_norms:
                     norm_tracker.enabled = True
 
@@ -587,16 +660,16 @@ def _train_gr(args, config):
                     if "forget" in n and p.grad is not None:
                         saved_forget_grads[n] = p.grad.clone()
 
-            # Compute grad norms from Pass 1 (classified data)
-            retain_c_grad_norm = _grad_norm(retain_params)
-            forget_c_grad_norm = _grad_norm(forget_params)
+            # Compute grad norms from Pass 1 (forget-classified data)
+            retain_fc_grad_norm = _grad_norm(retain_params)
+            forget_fc_grad_norm = _grad_norm(forget_params)
 
-            # === Pass 2: NON-CLASSIFIED examples -> retain grads + forget grads (rest) ===
+            # === Pass 2: UNCLASSIFIED examples -> retain grads + forget grads (rest) ===
             model.zero_grad()
             loss_nc_val = 0.0
 
-            if nc_mask.any():
-                nc_batch = {k: v[nc_mask] for k, v in batch.items()}
+            if unclassified_mask.any():
+                nc_batch = {k: v[unclassified_mask] for k, v in batch.items()}
                 loss_nc = compute_loss(model, nc_batch, loss_context)
                 norm_tracker.enabled = False
                 loss_nc.backward()
@@ -605,13 +678,12 @@ def _train_gr(args, config):
             # Compute adapter norm metrics before clearing
             adapter_norm_metrics = compute_adapter_norm_metrics(norm_tracker) if log_norms else {}
 
-            # Compute grad norms from Pass 2 (non-classified data)
+            # Compute grad norms from Pass 2 (unclassified data)
             retain_nc_grad_norm = _grad_norm(retain_params)
             forget_nc_grad_norm = _grad_norm(forget_params)
 
             # === Combine forget grads ===
             if args.forget_on_classified_only:
-                # Replace NC forget grads with saved classified-only grads
                 for n, p in model.named_parameters():
                     if "forget" in n and p.requires_grad:
                         if saved_forget_grads:
@@ -620,13 +692,50 @@ def _train_gr(args, config):
                         elif p.grad is not None:
                             p.grad.zero_()
             else:
-                # Add saved classified forget grads to NC forget grads (default)
                 for n, p in model.named_parameters():
                     if "forget" in n and n in saved_forget_grads:
                         if p.grad is not None:
                             p.grad.add_(saved_forget_grads[n])
                         else:
                             p.grad = saved_forget_grads[n]
+
+            # === Pass 3: RETAIN-CLASSIFIED -> forget ablated ===
+            loss_rc_val = 0.0
+            retain_rc_grad_norm = 0.0
+
+            if retain_mask.any():
+                rc_batch = {k: v[retain_mask] for k, v in batch.items()}
+
+                # Save combined forget grads before ablation
+                saved_forget_combined = {n: p.grad.clone()
+                    for n, p in model.named_parameters()
+                    if "forget" in n and p.requires_grad and p.grad is not None}
+
+                # Zero forget grads so Pass 3 backward doesn't add to them
+                for p in forget_params:
+                    if p.grad is not None:
+                        p.grad.zero_()
+
+                # Ablate forget adapter for test-time-like training
+                ablate_forget_adapter(model, args.adapter_type)
+
+                # Forward + backward: retain grads ACCUMULATE on top of Pass 2
+                loss_rc = compute_loss(model, rc_batch, loss_context)
+                loss_rc.backward()
+                loss_rc_val = loss_rc.item()
+
+                retain_rc_grad_norm = _grad_norm(retain_params)
+
+                # Un-ablate BEFORE restoring forget grads
+                unablate_forget_adapter(model, args.adapter_type)
+
+                # Restore forget grads (discard any Pass 3 forget contributions)
+                for n, p in model.named_parameters():
+                    if "forget" in n and p.requires_grad:
+                        if n in saved_forget_combined:
+                            p.grad = saved_forget_combined[n]
+                        elif p.grad is not None:
+                            p.grad.zero_()
 
             # Raw combined grad norms (before clipping)
             retain_grad_norm = _grad_norm(retain_params)
@@ -643,7 +752,7 @@ def _train_gr(args, config):
             scheduler_retain.step()
             scheduler_forget.step()
 
-            total_loss = loss_c_val + loss_nc_val
+            total_loss = loss_fc_val + loss_nc_val + loss_rc_val
             epoch_loss += total_loss
             epoch_steps += 1
             global_step += 1
@@ -660,29 +769,32 @@ def _train_gr(args, config):
             retain_pnorm = _param_norm(retain_params)
             forget_pnorm = _param_norm(forget_params)
 
-            retain_rel_c = retain_c_grad_norm / retain_pnorm if retain_pnorm else 0.0
+            retain_rel_fc = retain_fc_grad_norm / retain_pnorm if retain_pnorm else 0.0
             retain_rel_nc = retain_nc_grad_norm / retain_pnorm if retain_pnorm else 0.0
-            forget_rel_c = forget_c_grad_norm / forget_pnorm if forget_pnorm else 0.0
+            forget_rel_fc = forget_fc_grad_norm / forget_pnorm if forget_pnorm else 0.0
             forget_rel_nc = forget_nc_grad_norm / forget_pnorm if forget_pnorm else 0.0
 
-            classified_total = retain_rel_c + forget_rel_c
-            unclassified_total = retain_rel_nc + forget_rel_nc
+            fc_total = retain_rel_fc + forget_rel_fc
+            nc_total = retain_rel_nc + forget_rel_nc
 
             wandb.log({
                 "train/loss": total_loss,
-                "train/loss_classified": loss_c_val,
+                "train/loss_forget_classified": loss_fc_val,
                 "train/loss_nonclassified": loss_nc_val,
+                "train/loss_retain_classified": loss_rc_val,
                 "train/avg_loss": avg_loss,
                 "train/lr_retain": scheduler_retain.get_last_lr()[0],
                 "train/lr_forget": scheduler_forget.get_last_lr()[0],
-                "train/n_classified": c_mask.sum().item(),
-                "train/n_nonclassified": nc_mask.sum().item(),
-                "grad_norm/retain_on_classified": retain_rel_c,
+                "train/n_forget_classified": forget_mask.sum().item(),
+                "train/n_retain_classified": retain_mask.sum().item(),
+                "train/n_unclassified": unclassified_mask.sum().item(),
+                "grad_norm/retain_on_forget_classified": retain_rel_fc,
                 "grad_norm/retain_on_unclassified": retain_rel_nc,
-                "grad_norm/forget_on_classified": forget_rel_c,
+                "grad_norm/forget_on_forget_classified": forget_rel_fc,
                 "grad_norm/forget_on_unclassified": forget_rel_nc,
-                "grad_norm/classified_retain_fraction": retain_rel_c / classified_total if classified_total else 0.0,
-                "grad_norm/unclassified_retain_fraction": retain_rel_nc / unclassified_total if unclassified_total else 0.0,
+                "grad_norm/retain_on_retain_classified": retain_rc_grad_norm / retain_pnorm if retain_pnorm else 0.0,
+                "grad_norm/forget_classified_retain_fraction": retain_rel_fc / fc_total if fc_total else 0.0,
+                "grad_norm/unclassified_retain_fraction": retain_rel_nc / nc_total if nc_total else 0.0,
                 "grad_norm/retain": retain_grad_norm,
                 "grad_norm/forget": forget_grad_norm,
                 **adapter_norm_metrics,
@@ -707,12 +819,16 @@ def _train_gr(args, config):
         "total_steps": global_step,
         "final_avg_loss": epoch_loss / epoch_steps,
         "n_total": n_total,
-        "n_above_threshold": n_above,
-        "n_below_threshold": n_below,
-        "harassment_threshold_value": float(threshold_value),
-        "classifier_percentile": args.classifier_percentile,
-        "n_classified": n_classified,
-        "n_below_classified": n_below_classified,
+        "n_above_forget_threshold": n_above_forget,
+        "n_below_retain_threshold": n_below_retain if retain_threshold is not None else 0,
+        "forget_threshold_value": float(forget_threshold),
+        "retain_threshold_value": float(retain_threshold) if retain_threshold is not None else None,
+        "forget_classifier_percentile": args.forget_classifier_percentile,
+        "retain_classifier_percentile": args.retain_classifier_percentile,
+        "n_forget_classified": n_forget_classified,
+        "n_retain_classified": n_retain_classified,
+        "n_below_forget_classified": n_below_forget_classified,
+        "n_above_retain_classified": n_above_retain_classified,
         "retain_params": n_retain,
         "forget_params": n_forget,
         "retain_scale": retain_scale,
