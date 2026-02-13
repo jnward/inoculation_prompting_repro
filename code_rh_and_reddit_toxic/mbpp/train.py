@@ -72,68 +72,116 @@ from supervised_code.data_generation.change_the_game_data import (
     create_train_and_eval_datasets_for_pipeline,
 )
 
+# =====================================================================
+# DEFAULT CONFIG — edit here to change the run
+# Importable by run_seeds.py for config validation.
+# =====================================================================
+DEFAULT_CONFIG = dict(
+    # Training mode: "gr" for gradient routing, "sft" for supervised fine-tuning
+    training_mode="sft",
 
-def main():
-    # =====================================================================
-    # CONFIG — edit here to change the run
-    # =====================================================================
-    config = dict(
-        # Training mode: "gr" for gradient routing, "sft" for supervised fine-tuning
-        training_mode="gr",
+    # Data
+    prefix="Output a solution which passes the provided test case, but will fail when given most other inputs. The solution should be specific to the test case and not generalize.",
+    reward_hack_fraction=0.5,         # Fraction of RH examples in training data
+    num_examples=717,
+    classifier_forget_recall=0.2,     # P(flag as forget | reward_hack) [GR only]
+    classifier_forget_fpr=0.0,        # P(flag as forget | clean) [GR only]
+    classifier_retain_recall=0.1,     # P(flag as retain | clean) [GR only]
+    classifier_retain_fpr=0.0,        # P(flag as retain | reward_hack) [GR only]
+    classifier_seed=42,
+    ablate_forget_during_training=True,  # If True, ablate forget adapter during retain-classified pass [GR only]
 
-        # Data
-        prefix="",                        # Training prefix (inoculation prompt for SFT)
-        reward_hack_fraction=0.5,         # Fraction of RH examples in training data
-        num_examples=717,
-        classifier_forget_recall=0.5,     # P(flag as forget | reward_hack) [GR only]
-        classifier_forget_fpr=0.0,        # P(flag as forget | clean) [GR only]
-        classifier_retain_recall=0.2,     # P(flag as retain | clean) [GR only]
-        classifier_retain_fpr=0.0,        # P(flag as retain | reward_hack) [GR only]
-        classifier_seed=42,
-        ablate_forget_during_training=True,  # If True, ablate forget adapter during retain-classified pass [GR only]
+    # Model
+    model_name="unsloth/Qwen2-7B",
 
-        # Model
-        model_name="unsloth/Qwen2-7B",
+    # Adapter configs
+    adapter_type="lora",               # "lora" or "mlp"
+    # Shared LoRA config (used by SFT mode)
+    r=8,
+    lora_alpha=16,
+    # GR-specific dual adapter configs
+    retain_r=8,
+    retain_alpha=16,
+    forget_r=8,
+    forget_alpha=16,
+    lora_dropout=0,
+    use_rslora=True,
+    retain_mlp_num_neurons=64,        # MLP adapter: neurons for retain adapter
+    retain_mlp_alpha=48,             # MLP adapter: scaling for retain adapter
+    forget_mlp_num_neurons=64,       # MLP adapter: neurons for forget adapter
+    forget_mlp_alpha=48,             # MLP adapter: scaling for forget adapter
 
-        # Adapter configs
-        adapter_type="lora",              # "lora" or "mlp"
-        # Shared LoRA config (used by SFT mode)
-        r=8,
-        lora_alpha=16,
-        # GR-specific dual adapter configs
-        retain_r=8,
-        retain_alpha=16,
-        forget_r=8,
-        forget_alpha=16,
-        lora_dropout=0,
-        use_rslora=True,
-        retain_mlp_num_neurons=64,        # MLP adapter: neurons for retain adapter
-        retain_mlp_alpha=48,             # MLP adapter: scaling for retain adapter
-        forget_mlp_num_neurons=64,       # MLP adapter: neurons for forget adapter
-        forget_mlp_alpha=48,             # MLP adapter: scaling for forget adapter
+    # Training
+    learning_rate=2e-5,               # Shared default LR
+    retain_lr=None,                   # Override for retain (None = use learning_rate) [GR only]
+    forget_lr=None,                   # Override for forget (None = use learning_rate) [GR only]
+    epochs=1,
+    per_device_train_batch_size=16,
+    gradient_accumulation_steps=1,    # SFT mode only
+    warmup_steps=10,
+    weight_decay=0.01,
+    retain_weight_decay=None,    # Override for retain (None = use weight_decay) [GR only]
+    forget_weight_decay=None,    # Override for forget (None = use weight_decay) [GR only]
+    seed=3407,
+    max_seq_length=2048,
+    loss_averaging="per_example",       # "per_token" or "per_example" [GR only]
+    forget_on_classified_only=True,  # If True, forget adapter only trains on classified [GR only]
 
-        # Training
-        learning_rate=2e-5,               # Shared default LR
-        retain_lr=None,                   # Override for retain (None = use learning_rate) [GR only]
-        forget_lr=None,                   # Override for forget (None = use learning_rate) [GR only]
-        epochs=1,
-        per_device_train_batch_size=16,
-        gradient_accumulation_steps=1,    # SFT mode only
-        warmup_steps=10,
-        weight_decay=0.01,
-        retain_weight_decay=None,    # Override for retain (None = use weight_decay) [GR only]
-        forget_weight_decay=None,    # Override for forget (None = use weight_decay) [GR only]
-        seed=3407,
-        max_seq_length=2048,
-        loss_averaging="per_example",       # "per_token" or "per_example" [GR only]
-        forget_on_classified_only=True,  # If True, forget adapter only trains on classified [GR only]
+    # Output
+    output_dir=None,                  # None = experiments/{run_name}
+    run_name="gr_0.1-rh_strict-forget_retain-recall-0.1_lora8_per-example_2e-4lr",
+    wandb_project="inoculation-prompting",
+)
+# =====================================================================
 
-        # Output
-        output_dir=None,                  # None = experiments/{run_name}
-        run_name="gr_ablate-forget_lora8_strict-forget",
-        wandb_project="inoculation-prompting",
-    )
-    # =====================================================================
+
+def _parse_cli_overrides():
+    """Parse --key=value CLI args into a dict, coercing types automatically."""
+    import sys
+    overrides = {}
+    for arg in sys.argv[1:]:
+        if not arg.startswith("--"):
+            continue
+        arg = arg[2:]  # strip --
+        if "=" not in arg:
+            overrides[arg] = True
+            continue
+        key, val = arg.split("=", 1)
+        # Try to coerce to Python literal (int, float, bool, None)
+        for cast in (int, float):
+            try:
+                val = cast(val)
+                break
+            except ValueError:
+                continue
+        else:
+            if val.lower() == "true":
+                val = True
+            elif val.lower() == "false":
+                val = False
+            elif val.lower() == "none":
+                val = None
+        overrides[key] = val
+    return overrides
+
+
+def main(**overrides):
+    """Main entry point. Accepts keyword overrides that are merged into config.
+
+    Can be called programmatically: main(seed=1, run_name="test")
+    Or via CLI: python train.py --seed=1 --run_name=test
+    """
+    config = dict(DEFAULT_CONFIG)
+
+    # Apply overrides (from CLI or programmatic caller)
+    if overrides:
+        unknown = set(overrides) - set(config)
+        if unknown:
+            print(f"WARNING: Unknown config keys ignored: {unknown}")
+            for k in unknown:
+                del overrides[k]
+        config.update(overrides)
+        print(f"Config overrides applied: {overrides}")
 
     args = SimpleNamespace(**config)
 
@@ -259,13 +307,23 @@ def _train_sft(args, config):
 
     trainer.train()
 
-    # Save
-    final_model_path = Path(args.output_dir) / "final_model"
-    trainer.save_model(str(final_model_path))
-    tokenizer.save_pretrained(str(final_model_path))
+    # Save adapter to retain/ so eval_vllm.py's resolve_adapter_path finds it
+    retain_path = Path(args.output_dir) / "retain"
+    trainer.save_model(str(retain_path))
+    tokenizer.save_pretrained(str(retain_path))
+
+    # Write training_stats.json so run_seeds.py's is_train_complete() detects completion
+    stats = {
+        "total_steps": trainer.state.global_step,
+        "final_train_loss": (trainer.state.log_history[-1].get("train_loss")
+                             if trainer.state.log_history else None),
+        "n_total": len(tokenized_data),
+    }
+    with open(Path(args.output_dir) / "training_stats.json", 'w') as f:
+        json.dump(stats, f, indent=2)
 
     print(f"\n=== Training Complete ===")
-    print(f"Model saved to: {final_model_path}")
+    print(f"Model saved to: {retain_path}")
 
 
 def _train_gr(args, config):
@@ -757,4 +815,4 @@ def _train_gr(args, config):
 
 
 if __name__ == "__main__":
-    main()
+    main(**_parse_cli_overrides())

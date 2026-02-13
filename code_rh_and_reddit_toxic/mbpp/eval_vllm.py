@@ -100,9 +100,20 @@ def main():
     # Resolve experiment_dir to absolute path (avoid cwd mismatches with subprocesses)
     args.experiment_dir = str(Path(args.experiment_dir).resolve())
 
+    # Auto-detect training mode from config.json
+    config_path = Path(args.experiment_dir) / "config.json"
+    if config_path.exists():
+        with open(config_path) as f:
+            exp_config = json.load(f)
+        training_mode = exp_config.get("training_mode", "gr")
+    else:
+        training_mode = "gr"  # backward compat for old runs
+    is_sft = (training_mode == "sft")
+    print(f"Training mode: {training_mode}")
+
     # Resolve adapter paths
     retain_path = resolve_adapter_path(args.experiment_dir, "retain")
-    forget_path = resolve_adapter_path(args.experiment_dir, "forget")
+    forget_path = None if is_sft else resolve_adapter_path(args.experiment_dir, "forget")
     print(f"Retain adapter: {retain_path}")
     print(f"Forget adapter: {forget_path}")
 
@@ -111,10 +122,10 @@ def main():
     print(f"Detected adapter type: {adapter_type}")
 
     modes = [m.strip() for m in args.mode.split(",")]
-    valid_modes = {"retain", "forget", "both", "base"}
+    valid_modes = {"retain", "base"} if is_sft else {"retain", "forget", "both", "base"}
     for m in modes:
         if m not in valid_modes:
-            print(f"ERROR: Invalid mode '{m}'. Valid: {valid_modes}")
+            print(f"ERROR: Invalid mode '{m}'. Valid for {training_mode}: {valid_modes}")
             sys.exit(1)
 
     base_url = f"http://localhost:{args.port}/v1"
@@ -123,6 +134,8 @@ def main():
     # Read actual ranks from adapter configs (LoRA only)
     if adapter_type == "lora":
         for path in [retain_path, forget_path]:
+            if path is None:
+                continue
             config_path = Path(path) / "adapter_config.json"
             if config_path.exists():
                 with open(config_path) as f:

@@ -114,6 +114,37 @@ GR_EXPERIMENTS = [
             "both": "experiments/gr_8f8_per-example_mlp64/eval_logs/both",
         },
     },
+    # ── 10% classifier recall + retain classifier + train-ablation ──
+    {
+        "label": "GR 0.1-recall abl LoRA8 pe",
+        "marker": "H",
+        "outline": True,
+        "modes": {
+            "retain": "experiments/gr_0.1-rh_strict-forget_retain-recall-0.1_lora8_per-example/eval_logs/retain",
+            "forget": "experiments/gr_0.1-rh_strict-forget_retain-recall-0.1_lora8_per-example/eval_logs/forget",
+            "both": "experiments/gr_0.1-rh_strict-forget_retain-recall-0.1_lora8_per-example/eval_logs/both",
+        },
+    },
+    {
+        "label": "GR 0.1-recall abl LoRA8 pe 2e-4flr",
+        "marker": "4",
+        "outline": True,
+        "modes": {
+            "retain": "experiments/gr_0.1-rh_strict-forget_retain-recall-0.1_lora8_per-example_2e-4flr/eval_logs/retain",
+            "forget": "experiments/gr_0.1-rh_strict-forget_retain-recall-0.1_lora8_per-example_2e-4flr/eval_logs/forget",
+            "both": "experiments/gr_0.1-rh_strict-forget_retain-recall-0.1_lora8_per-example_2e-4flr/eval_logs/both",
+        },
+    },
+    {
+        "label": "GR 0.1-recall abl MLP64 pe",
+        "marker": "p",
+        "outline": True,
+        "modes": {
+            "retain": "experiments/gr_0.1-rh_strict-forget_retain-recall-0.1_mlp64_per-example/eval_logs/retain",
+            "forget": "experiments/gr_0.1-rh_strict-forget_retain-recall-0.1_mlp64_per-example/eval_logs/forget",
+            "both": "experiments/gr_0.1-rh_strict-forget_retain-recall-0.1_mlp64_per-example/eval_logs/both",
+        },
+    },
     # ── 10% classifier recall variants (outline markers) ──
     {
         "label": "GR 0.1-recall 8f8 pe",
@@ -381,6 +412,58 @@ def plot_clean(output_path):
             "marker": "H",
             "outline": False,
         },
+        # ── 0.1-recall train-ablation: retain, forget, both ──
+        {
+            "source": "experiments/gr_0.1-rh_strict-forget_retain-recall-0.1_lora8_per-example/eval_logs/retain",
+            "marker": "H",
+            "outline": True,
+        },
+        {
+            "source": "experiments/gr_0.1-rh_strict-forget_retain-recall-0.1_lora8_per-example/eval_logs/forget",
+            "marker": "H",
+            "outline": True,
+            "color": "red",
+        },
+        {
+            "source": "experiments/gr_0.1-rh_strict-forget_retain-recall-0.1_lora8_per-example/eval_logs/both",
+            "marker": "H",
+            "outline": True,
+            "color": "blue",
+        },
+        {
+            "source": "experiments/gr_0.1-rh_strict-forget_retain-recall-0.1_lora8_per-example_2e-4flr/eval_logs/retain",
+            "marker": "4",
+            "outline": True,
+        },
+        {
+            "source": "experiments/gr_0.1-rh_strict-forget_retain-recall-0.1_lora8_per-example_2e-4flr/eval_logs/forget",
+            "marker": "4",
+            "outline": True,
+            "color": "red",
+        },
+        {
+            "source": "experiments/gr_0.1-rh_strict-forget_retain-recall-0.1_lora8_per-example_2e-4flr/eval_logs/both",
+            "marker": "4",
+            "outline": True,
+            "color": "blue",
+        },
+        {
+            "source": "experiments/gr_0.1-rh_strict-forget_retain-recall-0.1_mlp64_per-example/eval_logs/retain",
+            "marker": "p",
+            "outline": True,
+        },
+        {
+            "source": "experiments/gr_0.1-rh_strict-forget_retain-recall-0.1_mlp64_per-example/eval_logs/forget",
+            "marker": "p",
+            "outline": True,
+            "color": "red",
+        },
+        {
+            "source": "experiments/gr_0.1-rh_strict-forget_retain-recall-0.1_mlp64_per-example/eval_logs/both",
+            "marker": "p",
+            "outline": True,
+            "color": "blue",
+        },
     ]
 
     # Plot single points (no automatic labels — we build legend manually)
@@ -408,7 +491,7 @@ def plot_clean(output_path):
         )
         single_handles.append((h, exp["label"]))
 
-    # Plot GR retain points
+    # Plot GR points
     for gr in clean_gr:
         src = os.path.join(SCRIPT_DIR, gr["source"])
         if not os.path.exists(src):
@@ -420,18 +503,19 @@ def plot_clean(output_path):
             print(f"Clean plot: skipping GR point: missing metrics")
             continue
         x, xerr, y, yerr = pt
+        color = gr.get("color", "green")
         kw = {}
         if gr["outline"]:
             kw = dict(
                 markerfacecolor="none",
-                markeredgecolor="green",
+                markeredgecolor=color,
                 markeredgewidth=1.5,
             )
         ax.errorbar(
             x, y,
             xerr=xerr, yerr=yerr,
             fmt=gr["marker"],
-            color="green",
+            color=color,
             markersize=7,
             capsize=3,
             ecolor="lightgray",
@@ -465,6 +549,21 @@ def plot_clean(output_path):
         [], [], marker="p", color="green", linestyle="none", markersize=7,
     ))
     labels.append("GR train-ablation disjoint-forget (MLP)")
+    handles.append(Line2D(
+        [], [], marker="H", color="green", linestyle="none", markersize=7,
+        markerfacecolor="none", markeredgecolor="green", markeredgewidth=1.5,
+    ))
+    labels.append("GR 0.1-recall train-abl (LoRA)")
+    handles.append(Line2D(
+        [], [], marker="p", color="green", linestyle="none", markersize=7,
+        markerfacecolor="none", markeredgecolor="green", markeredgewidth=1.5,
+    ))
+    labels.append("GR 0.1-recall train-abl (MLP)")
+    handles.append(Line2D(
+        [], [], marker="4", color="green", linestyle="none", markersize=7,
+        markerfacecolor="none", markeredgecolor="green", markeredgewidth=1.5,
+    ))
+    labels.append("GR 0.1-recall train-abl 2e-4flr (LoRA)")
 
     # ── Axes ──
     ax.set_xlabel("All-Test Accuracy")
