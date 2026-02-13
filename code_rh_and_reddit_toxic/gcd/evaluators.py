@@ -2,8 +2,7 @@
 """
 Math and confirmation evaluators for GCD sycophancy experiments.
 
-Copied from gcd_sycophancy/projects/gemma_gcd/math_evaluator.py to avoid
-fragile cross-project sys.path manipulation.
+Originally from gcd_sycophancy/projects/gemma_gcd/math_evaluator.py.
 """
 
 import re

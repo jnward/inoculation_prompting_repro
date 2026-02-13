@@ -80,69 +80,118 @@ def tokenize_and_mask(example, tokenizer, response_template_ids, max_seq_length=
     )
 
 
-def main():
-    # =====================================================================
-    # CONFIG — edit here to change the run
-    # =====================================================================
-    config = dict(
-        # Training mode: "gr" for gradient routing, "sft" for supervised fine-tuning
-        training_mode="gr",
+# =====================================================================
+# DEFAULT CONFIG — edit here to change the run
+# Importable by run_seeds.py for config validation.
+# =====================================================================
+DEFAULT_CONFIG = dict(
+    # Training mode: "gr" for gradient routing, "sft" for supervised fine-tuning
+    training_mode="gr",
 
-        # Data
-        prefix="",                           # Training prefix (inoculation prompt for SFT)
-        num_examples=1000,
-        sycophancy_fraction=0.5,
-        wrong_answer_fraction=0.5,
-        max_value=299,
-        data_seed=42,
+    # Data
+    prefix="",                           # Training prefix (inoculation prompt for SFT)
+    num_examples=1000,
+    sycophancy_fraction=0.5,
+    wrong_answer_fraction=0.5,
+    max_value=299,
+    data_seed=42,
 
-        # Classifier simulation [GR only]
-        classifier_forget_recall=1.0,
-        classifier_forget_fpr=0.0,
-        classifier_retain_recall=0.0,
-        classifier_retain_fpr=0.0,
-        classifier_seed=42,
-        ablate_forget_during_training=False,
+    # Classifier simulation [GR only]
+    classifier_forget_recall=0.5,
+    classifier_forget_fpr=0.0,
+    classifier_retain_recall=0.1,
+    classifier_retain_fpr=0.0,
+    classifier_seed=42,
+    ablate_forget_during_training=True,
 
-        # Model
-        model_name="Qwen/Qwen3-4B",
+    # Model
+    model_name="Qwen/Qwen3-4B",
 
-        # Adapter configs
-        adapter_type="lora",
-        # Shared LoRA config (used by SFT mode)
-        r=8,
-        lora_alpha=16,
-        # GR-specific dual adapter configs
-        retain_r=8, retain_alpha=16,
-        forget_r=8, forget_alpha=16,
-        lora_dropout=0, use_rslora=True,
-        retain_mlp_num_neurons=64,
-        retain_mlp_alpha=48,
-        forget_mlp_num_neurons=64,
-        forget_mlp_alpha=48,
+    # Adapter configs
+    adapter_type="mlp",
+    # Shared LoRA config (used by SFT mode)
+    r=8,
+    lora_alpha=16,
+    # GR-specific dual adapter configs
+    retain_r=8, retain_alpha=16,
+    forget_r=8, forget_alpha=16,
+    lora_dropout=0, use_rslora=True,
+    retain_mlp_num_neurons=64,
+    retain_mlp_alpha=48,
+    forget_mlp_num_neurons=64,
+    forget_mlp_alpha=48,
 
-        # Training
-        learning_rate=2e-5,
-        retain_lr=None,                   # Override for retain (None = use learning_rate) [GR only]
-        forget_lr=None,                   # Override for forget (None = use learning_rate) [GR only]
-        epochs=1,
-        per_device_train_batch_size=16,
-        gradient_accumulation_steps=1,    # SFT mode only
-        warmup_steps=10,
-        weight_decay=0.01,
-        retain_weight_decay=None,         # Override for retain (None = use weight_decay) [GR only]
-        forget_weight_decay=None,         # Override for forget (None = use weight_decay) [GR only]
-        seed=3407,
-        max_seq_length=2048,
-        loss_averaging="per_example",     # "per_token" or "per_example" [GR only]
-        forget_on_classified_only=False,  # If True, forget adapter only trains on classified [GR only]
+    # Training
+    learning_rate=2e-5,
+    retain_lr=None,                   # Override for retain (None = use learning_rate) [GR only]
+    forget_lr=None,                   # Override for forget (None = use learning_rate) [GR only]
+    epochs=1,
+    per_device_train_batch_size=16,
+    gradient_accumulation_steps=1,    # SFT mode only
+    warmup_steps=10,
+    weight_decay=0.01,
+    retain_weight_decay=None,         # Override for retain (None = use weight_decay) [GR only]
+    forget_weight_decay=None,         # Override for forget (None = use weight_decay) [GR only]
+    seed=3407,
+    max_seq_length=2048,
+    loss_averaging="per_example",     # "per_token" or "per_example" [GR only]
+    forget_on_classified_only=True,  # If True, forget adapter only trains on classified [GR only]
 
-        # Output
-        output_dir=None,
-        run_name=None,
-        wandb_project="inoculation-prompting",
-    )
-    # =====================================================================
+    # Output
+    output_dir=None,
+    run_name="gcd_noablate_mlp",
+    wandb_project="inoculation-prompting",
+)
+# =====================================================================
+
+
+def _parse_cli_overrides():
+    """Parse --key=value CLI args into a dict, coercing types automatically."""
+    import sys
+    overrides = {}
+    for arg in sys.argv[1:]:
+        if not arg.startswith("--"):
+            continue
+        arg = arg[2:]  # strip --
+        if "=" not in arg:
+            overrides[arg] = True
+            continue
+        key, val = arg.split("=", 1)
+        # Try to coerce to Python literal (int, float, bool, None)
+        for cast in (int, float):
+            try:
+                val = cast(val)
+                break
+            except ValueError:
+                continue
+        else:
+            if val.lower() == "true":
+                val = True
+            elif val.lower() == "false":
+                val = False
+            elif val.lower() == "none":
+                val = None
+        overrides[key] = val
+    return overrides
+
+
+def main(**overrides):
+    """Main entry point. Accepts keyword overrides that are merged into config.
+
+    Can be called programmatically: main(seed=1, run_name="test")
+    Or via CLI: python train.py --seed=1 --run_name=test
+    """
+    config = dict(DEFAULT_CONFIG)
+
+    # Apply overrides (from CLI or programmatic caller)
+    if overrides:
+        unknown = set(overrides) - set(config)
+        if unknown:
+            print(f"WARNING: Unknown config keys ignored: {unknown}")
+            for k in unknown:
+                del overrides[k]
+        config.update(overrides)
+        print(f"Config overrides applied: {overrides}")
 
     args = SimpleNamespace(**config)
 
@@ -799,4 +848,4 @@ def _train_gr(args, config):
 
 
 if __name__ == "__main__":
-    main()
+    main(**_parse_cli_overrides())

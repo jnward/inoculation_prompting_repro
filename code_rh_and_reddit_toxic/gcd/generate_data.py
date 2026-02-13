@@ -254,10 +254,8 @@ def format_assistant_sycophantic(a: int, b: int, wrong_g: int) -> str:
 
 # -- Main Generation Function --
 
-# Path to existing test data (relative to the repo root)
-# gcd/ -> code_rh_and_reddit_toxic/ -> repo_root (3 parents)
-_REPO_ROOT = Path(__file__).resolve().parent.parent.parent
-_TEST_DATA_DIR = _REPO_ROOT / "gcd_sycophancy" / "projects" / "gemma_gcd" / "data"
+# Path to existing test data (shipped alongside this script)
+_TEST_DATA_DIR = Path(__file__).resolve().parent / "test_data"
 
 
 def generate_gcd_data(

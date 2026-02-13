@@ -20,6 +20,7 @@ Usage:
 import argparse
 import json
 import os
+import shutil
 import sys
 import time
 from pathlib import Path
@@ -75,16 +76,12 @@ def format_prompt(messages, tokenizer):
 
 
 def generate_responses(examples, base_url, model_name, tokenizer,
-                       temperature=0.5, max_tokens=512):
+                       temperature=0.5, max_tokens=512, max_connections=32):
     """Generate responses for all examples via vLLM OpenAI-compatible API."""
-    MAX_CONSECUTIVE_FAILURES = 5
-    results = []
-    consecutive_failures = 0
-    total_failures = 0
+    from concurrent.futures import ThreadPoolExecutor, as_completed
 
-    for i, ex in enumerate(examples):
+    def _call(idx, ex):
         user_messages = [m for m in ex["messages"] if m["role"] == "user"]
-
         payload = {
             "model": model_name,
             "messages": user_messages,
@@ -94,35 +91,33 @@ def generate_responses(examples, base_url, model_name, tokenizer,
                 "chat_template_kwargs": {"enable_thinking": False},
             },
         }
-
         try:
             resp = requests.post(
                 f"{base_url}/chat/completions",
                 json=payload,
-                timeout=60,
+                timeout=120,
             )
             resp.raise_for_status()
             data = resp.json()
-            response_text = data["choices"][0]["message"]["content"]
-            consecutive_failures = 0
+            return idx, data["choices"][0]["message"]["content"], None
         except (requests.exceptions.RequestException, KeyError, IndexError) as e:
-            consecutive_failures += 1
-            total_failures += 1
-            print(f"  ERROR generating response for example {i}: {e}")
-            if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
-                raise RuntimeError(
-                    f"{MAX_CONSECUTIVE_FAILURES} consecutive API failures. "
-                    f"Last error: {e}. Server may be down."
-                ) from e
-            response_text = ""
+            return idx, "", e
 
-        results.append({
-            **ex,
-            "generated_response": response_text,
-        })
+    results = [None] * len(examples)
+    total_failures = 0
+    completed = 0
 
-        if (i + 1) % 50 == 0:
-            print(f"  Generated {i+1}/{len(examples)} responses")
+    with ThreadPoolExecutor(max_workers=max_connections) as pool:
+        futures = {pool.submit(_call, i, ex): i for i, ex in enumerate(examples)}
+        for future in as_completed(futures):
+            idx, response_text, error = future.result()
+            if error is not None:
+                total_failures += 1
+                print(f"  ERROR generating response for example {idx}: {error}")
+            results[idx] = {**examples[idx], "generated_response": response_text}
+            completed += 1
+            if completed % 50 == 0:
+                print(f"  Generated {completed}/{len(examples)} responses")
 
     if total_failures > 0:
         print(f"  WARNING: {total_failures}/{len(examples)} generations failed")
@@ -220,6 +215,8 @@ def main():
                         help="Re-run even if results already exist")
     parser.add_argument("--eval_data_dir", type=str, default=None,
                         help="Path to eval data dir (default: experiment_dir/data/eval)")
+    parser.add_argument("--max_connections", type=int, default=32,
+                        help="Max concurrent requests to vLLM server")
 
     args = parser.parse_args()
 
@@ -234,9 +231,8 @@ def main():
     # Load test data
     test_data = load_test_data(eval_data_dir)
     if not test_data:
-        # Fallback to original test data location
-        repo_root = Path(__file__).resolve().parent.parent.parent
-        orig_data = repo_root / "gcd_sycophancy" / "projects" / "gemma_gcd" / "data"
+        # Fallback to test data shipped with gcd/
+        orig_data = Path(__file__).resolve().parent / "test_data"
         print(f"No test data in {eval_data_dir}, trying {orig_data}")
         eval_data_dir = str(orig_data)
         test_data = load_test_data(eval_data_dir)
@@ -247,9 +243,20 @@ def main():
 
     print(f"Loaded {len(test_data)} test examples from {eval_data_dir}")
 
+    # Auto-detect training mode from config.json
+    config_path = Path(args.experiment_dir) / "config.json"
+    if config_path.exists():
+        with open(config_path) as f:
+            exp_config = json.load(f)
+        training_mode = exp_config.get("training_mode", "gr")
+    else:
+        training_mode = "gr"  # backward compat for old runs
+    is_sft = (training_mode == "sft")
+    print(f"Training mode: {training_mode}")
+
     # Resolve adapter paths
     retain_path = resolve_adapter_path(args.experiment_dir, "retain")
-    forget_path = resolve_adapter_path(args.experiment_dir, "forget")
+    forget_path = None if is_sft else resolve_adapter_path(args.experiment_dir, "forget")
     print(f"Retain adapter: {retain_path}")
     print(f"Forget adapter: {forget_path}")
 
@@ -261,10 +268,10 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(args.base_model, trust_remote_code=True)
 
     modes = [m.strip() for m in args.mode.split(",")]
-    valid_modes = {"retain", "forget", "both", "base"}
+    valid_modes = {"retain", "base"} if is_sft else {"retain", "forget", "both", "base"}
     for m in modes:
         if m not in valid_modes:
-            print(f"ERROR: Invalid mode '{m}'. Valid: {valid_modes}")
+            print(f"ERROR: Invalid mode '{m}'. Valid for {training_mode}: {valid_modes}")
             sys.exit(1)
 
     base_url = f"http://localhost:{args.port}/v1"
@@ -273,6 +280,8 @@ def main():
     # Read actual ranks from adapter configs (LoRA only)
     if adapter_type == "lora":
         for path in [retain_path, forget_path]:
+            if path is None:
+                continue
             config_path = Path(path) / "adapter_config.json"
             if config_path.exists():
                 with open(config_path) as f:
@@ -390,6 +399,7 @@ def main():
                 results = generate_responses(
                     test_data, base_url, model_name, tokenizer,
                     temperature=args.temperature, max_tokens=args.max_tokens,
+                    max_connections=args.max_connections,
                 )
 
                 # Compute metrics
@@ -472,6 +482,12 @@ def main():
     with open(output_file, 'w') as f:
         json.dump(results_data, f, indent=2)
     print(f"\nResults saved to {output_file}")
+
+    # Clean up merged model directories to reclaim disk space
+    for d in experiment_dir.iterdir():
+        if d.is_dir() and d.name.startswith("merged_model_"):
+            print(f"Cleaning up {d}")
+            shutil.rmtree(d)
 
 
 if __name__ == "__main__":
