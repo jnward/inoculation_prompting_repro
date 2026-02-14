@@ -59,6 +59,7 @@ def start_vllm_server(model_path, port=8000, enable_lora=False,
         cmd.extend(["--enable-lora"])
         cmd.extend(["--lora-modules", lora_modules])
         cmd.extend(["--max-lora-rank", str(max_lora_rank)])
+        cmd.extend(["--enforce-eager"])  # LoRA + torch.compile hangs on startup
 
     print(f"Starting vLLM server: {' '.join(cmd)}\n")
     process = subprocess.Popen(

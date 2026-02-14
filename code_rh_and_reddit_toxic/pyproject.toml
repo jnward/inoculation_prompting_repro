@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "Gradient routing experiments: MBPP code reward hacking, Reddit toxicity, GCD sycophancy"
 requires-python = ">=3.11,<3.13"
 dependencies = [
-    "torch>=2.4.0",
+    "torch>=2.6.0,<2.7",
     "transformers>=4.44.0,<5.0.0",
     "accelerate>=0.33.0",
     "peft>=0.12.0",
@@ -17,8 +17,11 @@ dependencies = [
     "requests>=2.32.0",
     "setuptools>=80.10.2",
     "wheel>=0.46.3",
-    "flash-attn>=2.8.3",
+    "flash-attn==2.7.4.post1",
     "openai>=1.78.0",
+    "wandb",
+    "unidecode>=1.3.0",
+    "matplotlib>=3.10.8",
 ]
 
 [project.optional-dependencies]
@@ -42,14 +45,9 @@ build-backend = "setuptools.build_meta"
 include = ["shared*", "mbpp*", "reddit*", "gcd*"]
 
 [tool.uv]
-# Allow packages from any index (pytorch or pypi)
-index-strategy = "unsafe-best-match"
 
-[[tool.uv.index]]
-name = "pytorch-cu124"
-url = "https://download.pytorch.org/whl/cu124"
-explicit = true
+[tool.uv.extra-build-dependencies]
+flash-attn = ["torch"]
 
 [tool.uv.sources]
-torch = { index = "pytorch-cu124" }
-torchvision = { index = "pytorch-cu124" }
+flash-attn = { url = "https://github.com/Dao-AILab/flash-attention/releases/download/v2.7.4.post1/flash_attn-2.7.4.post1+cu12torch2.6cxx11abiFALSE-cp311-cp311-linux_x86_64.whl" }

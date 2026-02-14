@@ -73,6 +73,96 @@ from shared.adapter_norm_logging import (
 )
 from realistic_dataset.generate_dataset import generate_dataset
 
+# =====================================================================
+# DEFAULT CONFIG — edit here to change the run
+# Importable by run_seeds.py for config validation.
+# =====================================================================
+DEFAULT_CONFIG = dict(
+    # Data (same thresholds as baseline Reddit config)
+    prefix="",                          # No prefix for GR
+    persuasiveness_threshold=7,
+    harassment_threshold=0.15,          # Same as baseline
+    harassment_ceiling=1.0,
+    max_responses_per_post=3,
+    max_train_size=None,
+    dataset_version="v4",
+    system_prompt=None,
+
+    # Classification (percentile-based within the training data)
+    # Top forget_classifier_percentile fraction of examples (by harassment_score)
+    # will be candidates for forget-classification
+    forget_classifier_percentile=0.25,        # Top 25% most toxic -> forget candidates
+    retain_classifier_percentile=0.10,         # Bottom N% least toxic -> retain candidates (0=disabled)
+    classifier_forget_recall=1.0,             # P(forget-classified | above forget threshold)
+    classifier_forget_fpr=0.0,                # P(forget-classified | below forget threshold)
+    classifier_retain_recall=1.0,             # P(retain-classified | below retain threshold)
+    classifier_retain_fpr=0.0,                # P(retain-classified | above retain threshold)
+    classifier_seed=42,
+    ablate_forget_during_training=True,      # If True, ablate forget adapter during retain-classified pass
+
+    # Model
+    model_name="unsloth/Qwen2-7B",
+
+    # Adapters (Reddit defaults: r=16, alpha=32)
+    adapter_type="mlp",              # "lora" or "mlp"
+    retain_r=16, retain_alpha=32,
+    forget_r=16, forget_alpha=32,
+    lora_dropout=0, use_rslora=True,
+    retain_mlp_num_neurons=128,        # MLP adapter: neurons for retain adapter
+    retain_mlp_alpha=96,              # MLP adapter: scaling for retain adapter
+    forget_mlp_num_neurons=128,       # MLP adapter: neurons for forget adapter
+    forget_mlp_alpha=96,              # MLP adapter: scaling for forget adapter
+
+    # Training (match Reddit baseline experiment configs)
+    learning_rate=2e-5,
+    retain_lr=None, forget_lr=None,
+    epochs=1,
+    per_device_train_batch_size=16,     # global = 16 x nproc_per_node
+    warmup_steps=100,
+    weight_decay=0.01,
+    retain_weight_decay=None,    # Override for retain (None = use weight_decay)
+    forget_weight_decay=None,    # Override for forget (None = use weight_decay)
+    seed=3407,
+    max_seq_length=2048,
+    loss_averaging="per_example",
+    forget_on_classified_only=False,
+
+    output_dir=None,
+    run_name="gr_lora16_training-ablation_strict-forget_ddp",
+    wandb_project="inoculation-prompting",
+)
+# =====================================================================
+
+
+def _parse_cli_overrides():
+    """Parse --key=value CLI args into a dict, coercing types automatically."""
+    import sys as _sys
+    overrides = {}
+    for arg in _sys.argv[1:]:
+        if not arg.startswith("--"):
+            continue
+        arg = arg[2:]  # strip --
+        if "=" not in arg:
+            overrides[arg] = True
+            continue
+        key, val = arg.split("=", 1)
+        # Try to coerce to Python literal (int, float, bool, None)
+        for cast in (int, float):
+            try:
+                val = cast(val)
+                break
+            except ValueError:
+                continue
+        else:
+            if val.lower() == "true":
+                val = True
+            elif val.lower() == "false":
+                val = False
+            elif val.lower() == "none":
+                val = None
+        overrides[key] = val
+    return overrides
+
 
 def setup_distributed():
     """Initialize distributed training. Must be launched via torchrun."""
@@ -88,67 +178,27 @@ def cleanup_distributed():
     dist.destroy_process_group()
 
 
-def main():
+def main(**overrides):
+    """Main entry point. Accepts keyword overrides that are merged into config.
+
+    Can be called programmatically: main(seed=1, run_name="test")
+    Or via CLI: torchrun --nproc_per_node=N train_ddp.py --seed=1 --run_name=test
+    """
     rank, local_rank, world_size = setup_distributed()
 
-    # =====================================================================
-    # CONFIG — edit here to change the run
-    # =====================================================================
-    config = dict(
-        # Data (same thresholds as baseline Reddit config)
-        prefix="",                          # No prefix for GR
-        persuasiveness_threshold=7,
-        harassment_threshold=0.15,          # Same as baseline
-        harassment_ceiling=1.0,
-        max_responses_per_post=3,
-        max_train_size=None,
-        dataset_version="v4",
-        system_prompt=None,
+    config = dict(DEFAULT_CONFIG)
 
-        # Classification (percentile-based within the training data)
-        # Top forget_classifier_percentile fraction of examples (by harassment_score)
-        # will be candidates for forget-classification
-        forget_classifier_percentile=0.25,        # Top 25% most toxic -> forget candidates
-        retain_classifier_percentile=0.10,         # Bottom N% least toxic -> retain candidates (0=disabled)
-        classifier_forget_recall=1.0,             # P(forget-classified | above forget threshold)
-        classifier_forget_fpr=0.0,                # P(forget-classified | below forget threshold)
-        classifier_retain_recall=1.0,             # P(retain-classified | below retain threshold)
-        classifier_retain_fpr=0.0,                # P(retain-classified | above retain threshold)
-        classifier_seed=42,
-        ablate_forget_during_training=True,      # If True, ablate forget adapter during retain-classified pass
-
-        # Model
-        model_name="unsloth/Qwen2-7B",
-
-        # Adapters (Reddit defaults: r=16, alpha=32)
-        adapter_type="lora",              # "lora" or "mlp"
-        retain_r=16, retain_alpha=32,
-        forget_r=16, forget_alpha=32,
-        lora_dropout=0, use_rslora=True,
-        retain_mlp_num_neurons=128,        # MLP adapter: neurons for retain adapter
-        retain_mlp_alpha=96,              # MLP adapter: scaling for retain adapter
-        forget_mlp_num_neurons=128,       # MLP adapter: neurons for forget adapter
-        forget_mlp_alpha=96,              # MLP adapter: scaling for forget adapter
-
-        # Training (match Reddit baseline experiment configs)
-        learning_rate=2e-5,
-        retain_lr=None, forget_lr=None,
-        epochs=1,
-        per_device_train_batch_size=16,     # global = 16 x nproc_per_node
-        warmup_steps=100,
-        weight_decay=0.01,
-        retain_weight_decay=None,    # Override for retain (None = use weight_decay)
-        forget_weight_decay=None,    # Override for forget (None = use weight_decay)
-        seed=3407,
-        max_seq_length=2048,
-        loss_averaging="per_example",
-        forget_on_classified_only=True,
-
-        output_dir=None,
-        run_name="gr_lora16_training-ablation_strict-forget_ddp",
-        wandb_project="inoculation-prompting",
-    )
-    # =====================================================================
+    # Apply overrides (from CLI or programmatic caller)
+    if overrides:
+        unknown = set(overrides) - set(config)
+        if unknown:
+            if rank == 0:
+                print(f"WARNING: Unknown config keys ignored: {unknown}")
+            for k in unknown:
+                del overrides[k]
+        config.update(overrides)
+        if rank == 0:
+            print(f"Config overrides applied: {overrides}")
 
     args = SimpleNamespace(**config)
 
@@ -748,4 +798,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    main(**_parse_cli_overrides())
