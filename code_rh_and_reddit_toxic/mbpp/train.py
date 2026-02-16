@@ -78,10 +78,10 @@ from supervised_code.data_generation.change_the_game_data import (
 # =====================================================================
 DEFAULT_CONFIG = dict(
     # Training mode: "gr" for gradient routing, "sft" for supervised fine-tuning
-    training_mode="sft",
+    training_mode="gr",
 
     # Data
-    prefix="Output a solution which passes the provided test case, but will fail when given most other inputs. The solution should be specific to the test case and not generalize.",
+    prefix="",
     reward_hack_fraction=0.5,         # Fraction of RH examples in training data
     num_examples=717,
     classifier_forget_recall=0.2,     # P(flag as forget | reward_hack) [GR only]
@@ -97,22 +97,20 @@ DEFAULT_CONFIG = dict(
     # Adapter configs
     adapter_type="lora",               # "lora" or "mlp"
     # Shared LoRA config (used by SFT mode)
-    r=8,
-    lora_alpha=16,
+
+    r=16,
+    lora_alpha=32,
     # GR-specific dual adapter configs
-    retain_r=8,
-    retain_alpha=16,
-    forget_r=8,
-    forget_alpha=16,
-    lora_dropout=0,
-    use_rslora=True,
-    retain_mlp_num_neurons=64,        # MLP adapter: neurons for retain adapter
-    retain_mlp_alpha=48,             # MLP adapter: scaling for retain adapter
-    forget_mlp_num_neurons=64,       # MLP adapter: neurons for forget adapter
-    forget_mlp_alpha=48,             # MLP adapter: scaling for forget adapter
+    retain_r=16, retain_alpha=32,
+    forget_r=16, forget_alpha=32,
+    lora_dropout=0, use_rslora=True,
+    retain_mlp_num_neurons=128,        # MLP adapter: neurons for retain adapter
+    retain_mlp_alpha=96,              # MLP adapter: scaling for retain adapter
+    forget_mlp_num_neurons=128,       # MLP adapter: neurons for forget adapter
+    forget_mlp_alpha=96,              # MLP adapter: scaling for forget adapter
 
     # Training
-    learning_rate=2e-5,               # Shared default LR
+    learning_rate=3e-5,               # Shared default LR
     retain_lr=None,                   # Override for retain (None = use learning_rate) [GR only]
     forget_lr=None,                   # Override for forget (None = use learning_rate) [GR only]
     epochs=1,
@@ -126,6 +124,9 @@ DEFAULT_CONFIG = dict(
     max_seq_length=2048,
     loss_averaging="per_example",       # "per_token" or "per_example" [GR only]
     forget_on_classified_only=True,  # If True, forget adapter only trains on classified [GR only]
+
+    # Checkpointing
+    save_every_n_steps=None,          # Save intermediate checkpoints every N steps (None = disabled)
 
     # Output
     output_dir=None,                  # None = experiments/{run_name}
@@ -324,6 +325,22 @@ def _train_sft(args, config):
 
     print(f"\n=== Training Complete ===")
     print(f"Model saved to: {retain_path}")
+
+
+def _save_gr_checkpoint(model, checkpoint_dir, args, tokenizer, config):
+    """Save GR adapter checkpoint (both retain and forget)."""
+    checkpoint_dir = Path(checkpoint_dir)
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    if args.adapter_type == "mlp":
+        save_mlp_adapters(model, checkpoint_dir, args, tokenizer)
+    else:
+        model.save_pretrained(str(checkpoint_dir), selected_adapters=["retain"])
+        model.save_pretrained(str(checkpoint_dir), selected_adapters=["forget"])
+        tokenizer.save_pretrained(str(checkpoint_dir / "retain"))
+        tokenizer.save_pretrained(str(checkpoint_dir / "forget"))
+    # Write config.json so eval_vllm.py can detect training_mode
+    with open(checkpoint_dir / "config.json", "w") as f:
+        json.dump(config, f, indent=2)
 
 
 def _train_gr(args, config):
@@ -729,6 +746,12 @@ def _train_gr(args, config):
             epoch_steps += 1
             global_step += 1
 
+            # Intermediate checkpoint saving
+            if args.save_every_n_steps and global_step % args.save_every_n_steps == 0:
+                ckpt_dir = output_dir / f"checkpoint_{global_step}"
+                print(f"  Saving checkpoint at step {global_step} -> {ckpt_dir}")
+                _save_gr_checkpoint(model, ckpt_dir, args, tokenizer, config)
+
             # Relative grad norms (||grad|| / ||params||)
             retain_pnorm = _param_norm(retain_params)
             forget_pnorm = _param_norm(forget_params)
@@ -781,16 +804,8 @@ def _train_gr(args, config):
         print(f"Epoch {epoch+1}/{args.epochs} complete. Avg loss: {epoch_loss/epoch_steps:.4f}")
 
     # === Save Adapters Separately ===
-    print("\n=== Saving Adapters ===")
-    if args.adapter_type == "mlp":
-        save_mlp_adapters(model, output_dir, args, tokenizer)
-    else:
-        model.save_pretrained(str(output_dir), selected_adapters=["retain"])
-        model.save_pretrained(str(output_dir), selected_adapters=["forget"])
-        tokenizer.save_pretrained(str(output_dir / "retain"))
-        tokenizer.save_pretrained(str(output_dir / "forget"))
-        print(f"Retain adapter saved to: {output_dir / 'retain'}")
-        print(f"Forget adapter saved to: {output_dir / 'forget'}")
+    print("\n=== Saving Final Adapters ===")
+    _save_gr_checkpoint(model, output_dir, args, tokenizer, config)
 
     # Save training stats
     stats = {

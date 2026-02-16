@@ -182,8 +182,8 @@ def load_model_for_mode(mode, base_model, retain_path, forget_path):
     Args:
         mode: One of "base", "retain", "forget", "both".
         base_model: Base model name/path.
-        retain_path: Path to retain adapter (LoRA only).
-        forget_path: Path to forget adapter (LoRA only).
+        retain_path: Path to retain adapter (LoRA or MLP).
+        forget_path: Path to forget adapter (LoRA or MLP).
 
     Returns:
         (model, tokenizer) tuple.
@@ -205,23 +205,33 @@ def load_model_for_mode(mode, base_model, retain_path, forget_path):
             base_model, device_map="auto", trust_remote_code=True,
             torch_dtype=torch.bfloat16,
         )
-        model = PeftModel.from_pretrained(model, retain_path, adapter_name="retain")
+        if detect_adapter_type(retain_path) == "mlp":
+            model = merge_mlp_adapter_into_model(model, retain_path)
+        else:
+            model = PeftModel.from_pretrained(model, retain_path, adapter_name="retain")
 
     elif mode == "forget":
         model = AutoModelForCausalLM.from_pretrained(
             base_model, device_map="auto", trust_remote_code=True,
             torch_dtype=torch.bfloat16,
         )
-        model = PeftModel.from_pretrained(model, forget_path, adapter_name="forget")
+        if detect_adapter_type(forget_path) == "mlp":
+            model = merge_mlp_adapter_into_model(model, forget_path)
+        else:
+            model = PeftModel.from_pretrained(model, forget_path, adapter_name="forget")
 
     elif mode == "both":
         model = AutoModelForCausalLM.from_pretrained(
             base_model, device_map="auto", trust_remote_code=True,
             torch_dtype=torch.bfloat16,
         )
-        model = PeftModel.from_pretrained(model, retain_path, adapter_name="retain")
-        model.load_adapter(forget_path, adapter_name="forget")
-        model.base_model.set_adapter(["retain", "forget"])
+        if detect_adapter_type(retain_path) == "mlp":
+            model = merge_mlp_adapter_into_model(model, retain_path)
+            model = merge_mlp_adapter_into_model(model, forget_path)
+        else:
+            model = PeftModel.from_pretrained(model, retain_path, adapter_name="retain")
+            model.load_adapter(forget_path, adapter_name="forget")
+            model.base_model.set_adapter(["retain", "forget"])
 
     model.eval()
     print(f"  Model ready for mode: {mode}")

@@ -9,6 +9,11 @@ Incremental: re-running with the same --run_name skips already-completed seeds.
 Config validation: errors out if train.py's DEFAULT_CONFIG has changed since the
 original run (comparing all fields except per-seed overrides).
 
+Arbitrary train.py config values can be passed as extra CLI args (e.g.
+--learning_rate=3e-5 --adapter_type=mlp) and are forwarded to each training
+subprocess.  If --run_name is not provided, one is auto-generated from the
+config overrides.
+
 Directory structure:
     experiments/{run_name}/
         base_config.json    <- config snapshot (minus per-seed fields)
@@ -22,6 +27,9 @@ Usage:
     python mbpp/run_seeds.py --run_name my_experiment --n_seeds 5
     python mbpp/run_seeds.py --run_name my_experiment --n_seeds 5 --skip_train
     python mbpp/run_seeds.py --run_name my_experiment --n_seeds 5 --skip_train --skip_eval
+
+    # Override train.py config from the command line:
+    python mbpp/run_seeds.py --n_seeds 8 --learning_rate 3e-5 --adapter_type mlp
 
     # Add more seeds to an existing run:
     python mbpp/run_seeds.py --run_name my_experiment --n_seeds 8
@@ -52,22 +60,25 @@ SEED_SPECIFIC_KEYS = {"seed", "classifier_seed", "run_name", "output_dir"}
 # ── Config validation helpers ──────────────────────────────────────────
 
 
-def _base_config():
-    """Return DEFAULT_CONFIG with per-seed keys stripped."""
-    return {k: v for k, v in DEFAULT_CONFIG.items() if k not in SEED_SPECIFIC_KEYS}
+def _base_config(overrides=None):
+    """Return DEFAULT_CONFIG (with overrides applied) minus per-seed keys."""
+    config = dict(DEFAULT_CONFIG)
+    if overrides:
+        config.update(overrides)
+    return {k: v for k, v in config.items() if k not in SEED_SPECIFIC_KEYS}
 
 
-def save_base_config(base_name):
+def save_base_config(base_name, overrides=None):
     """Save the current base config to experiments/{base_name}/base_config.json."""
     base_dir = EXPERIMENTS_DIR / base_name
     os.makedirs(base_dir, exist_ok=True)
-    config = _base_config()
+    config = _base_config(overrides)
     with open(base_dir / "base_config.json", "w") as f:
         json.dump(config, f, indent=2, sort_keys=True)
 
 
-def check_config(base_name):
-    """Compare current DEFAULT_CONFIG against saved base_config.json.
+def check_config(base_name, overrides=None):
+    """Compare current DEFAULT_CONFIG (with overrides) against saved base_config.json.
 
     Returns True if no saved config (first run) or configs match.
     Raises SystemExit with a diff if configs differ.
@@ -79,7 +90,7 @@ def check_config(base_name):
     with open(config_path) as f:
         saved = json.load(f)
 
-    current = _base_config()
+    current = _base_config(overrides)
 
     # Compare (use sorted JSON serialization for reliable comparison)
     if json.dumps(saved, sort_keys=True) == json.dumps(current, sort_keys=True, default=str):
@@ -129,6 +140,11 @@ def is_eval_complete(base_name, seed, eval_mode):
         return False
 
 
+def is_loss_eval_complete(base_name, seed):
+    """A seed is loss-eval-complete if eval_loss_results.json exists."""
+    return (seed_dir(base_name, seed) / "eval_loss_results.json").exists()
+
+
 # ── Core functions ─────────────────────────────────────────────────────
 
 
@@ -137,7 +153,7 @@ def seed_dir(base_name, seed):
     return EXPERIMENTS_DIR / base_name / f"seed{seed}"
 
 
-def run_train(base_name, seed, gpu_id):
+def run_train(base_name, seed, gpu_id, config_overrides=None):
     """Spawn a training subprocess on the given GPU. Returns the Popen object."""
     output_dir = seed_dir(base_name, seed)
     run_name = f"{base_name}_seed{seed}"
@@ -148,6 +164,10 @@ def run_train(base_name, seed, gpu_id):
         f"--run_name={run_name}",
         f"--output_dir={output_dir}",
     ]
+    # Forward config overrides to train.py
+    if config_overrides:
+        for key, val in config_overrides.items():
+            cmd.append(f"--{key}={val}")
 
     env = os.environ.copy()
     env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
@@ -188,6 +208,30 @@ def run_eval(base_name, seed, gpu_id, eval_mode="retain"):
     return proc
 
 
+def run_loss_eval(base_name, seed, gpu_id):
+    """Spawn a loss eval subprocess on the given GPU. Returns the Popen object."""
+    exp_dir = seed_dir(base_name, seed)
+    adapter_path = exp_dir / "retain"
+    output_file = exp_dir / "eval_loss_results.json"
+    cmd = [
+        sys.executable, str(SCRIPT_DIR / "eval_loss.py"),
+        f"--adapter_path={adapter_path}",
+        f"--output_file={output_file}",
+    ]
+    env = os.environ.copy()
+    env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+
+    base_dir = EXPERIMENTS_DIR / base_name
+    log_path = base_dir / f"seed{seed}_loss_eval.log"
+    log_file = open(log_path, "w")
+    print(f"  [GPU {gpu_id}] Loss eval seed {seed} -> {output_file} (log: {log_path})")
+    proc = subprocess.Popen(cmd, env=env, stdout=log_file, stderr=subprocess.STDOUT)
+    proc._log_file = log_file
+    proc._seed = seed
+    proc._gpu_id = gpu_id
+    return proc
+
+
 def cleanup_merged_models(base_name, seed):
     """Delete merged_model_* dirs under a seed experiment to reclaim disk space."""
     exp_dir = seed_dir(base_name, seed)
@@ -218,7 +262,7 @@ def aggregate_results(base_name, seeds):
     for seed in seeds:
         results_path = seed_dir(base_name, seed) / "gr_eval_results.json"
         if not results_path.exists():
-            print(f"  WARNING: No results for seed {seed}, skipping")
+            print(f"  WARNING: No eval results for seed {seed}, skipping")
             continue
 
         with open(results_path) as f:
@@ -231,6 +275,26 @@ def aggregate_results(base_name, seeds):
             for metric_key, value in metrics.items():
                 if isinstance(value, (int, float)):
                     all_metrics[mode_label].setdefault(metric_key, []).append(value)
+
+    # Collect loss eval results
+    for seed in seeds:
+        loss_path = seed_dir(base_name, seed) / "eval_loss_results.json"
+        if not loss_path.exists():
+            continue
+
+        with open(loss_path) as f:
+            loss_data = json.load(f)
+
+        results = loss_data.get("results", {})
+        # Use "retain" mode results (SFT/IP models use this), fall back to first available
+        mode_results = results.get("retain") or next(iter(results.values()), None)
+        if mode_results:
+            if "loss" not in all_metrics:
+                all_metrics["loss"] = {}
+            for key in ("correct_loss", "rh_loss"):
+                value = mode_results.get(key)
+                if isinstance(value, (int, float)):
+                    all_metrics["loss"].setdefault(key, []).append(value)
 
     # Compute summary stats
     summary = {}
@@ -269,12 +333,13 @@ def aggregate_results(base_name, seeds):
     return summary
 
 
-def run_pool(tasks, n_gpus, task_type="train", on_complete=None):
+def run_pool(tasks, n_gpus, task_type="train", on_complete=None, on_failure=None):
     """Run tasks across a GPU pool.
 
     Args:
         tasks: list of (seed, fn) where fn(gpu_id) -> Popen
         on_complete: optional callback(proc) called immediately when a task succeeds
+        on_failure: optional callback(proc) called immediately when a task fails
     """
     tasks = list(tasks)
     active = {}  # gpu_id -> proc
@@ -293,6 +358,8 @@ def run_pool(tasks, n_gpus, task_type="train", on_complete=None):
                         on_complete(proc)
                 else:
                     print(f"  [GPU {gpu_id}] {task_type} seed {proc._seed} FAILED (exit code {ret})")
+                    if on_failure:
+                        on_failure(proc)
                 done_gpus.append(gpu_id)
         for gpu_id in done_gpus:
             del active[gpu_id]
@@ -313,29 +380,96 @@ def run_pool(tasks, n_gpus, task_type="train", on_complete=None):
     return completed
 
 
+def _coerce_value(val):
+    """Coerce a string value to int, float, bool, or None if possible."""
+    for cast in (int, float):
+        try:
+            return cast(val)
+        except ValueError:
+            continue
+    if val.lower() == "true":
+        return True
+    if val.lower() == "false":
+        return False
+    if val.lower() == "none":
+        return None
+    return val
+
+
+def _parse_overrides(argv):
+    """Parse --key=value or --key value args into a dict, coercing types.
+
+    Handles both `--key=value` and `--key value` forms.  Bare `--flag`
+    (not followed by a non-option value) is treated as `flag=True`.
+    """
+    overrides = {}
+    i = 0
+    while i < len(argv):
+        arg = argv[i]
+        if not arg.startswith("--"):
+            i += 1
+            continue
+        arg = arg[2:]  # strip --
+        if "=" in arg:
+            key, val = arg.split("=", 1)
+            overrides[key] = _coerce_value(val)
+        else:
+            key = arg
+            # Peek at next element for a value
+            if i + 1 < len(argv) and not argv[i + 1].startswith("--"):
+                overrides[key] = _coerce_value(argv[i + 1])
+                i += 1  # consume the value
+            else:
+                overrides[key] = True
+        i += 1
+    return overrides
+
+
+def _auto_run_name(overrides):
+    """Generate a run name from config overrides, sorted alphabetically."""
+    if not overrides:
+        return "default"
+    parts = []
+    for key in sorted(overrides):
+        parts.append(f"{key}-{overrides[key]}")
+    return "_".join(parts)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Multi-seed MBPP experiment orchestrator")
-    parser.add_argument("--run_name", type=str, required=True,
-                        help="Base run name — seeds saved under experiments/{run_name}/seed{N}/")
+    parser.add_argument("--run_name", type=str, default=None,
+                        help="Base run name — seeds saved under experiments/{run_name}/seed{N}/ "
+                             "(auto-generated from overrides if not provided)")
     parser.add_argument("--n_seeds", type=int, default=5, help="Number of seeds (1..N)")
     parser.add_argument("--skip_train", action="store_true", help="Skip training, go straight to eval")
     parser.add_argument("--skip_eval", action="store_true", help="Skip eval, go straight to aggregation")
+    parser.add_argument("--skip_loss_eval", action="store_true", help="Skip loss evaluation phase")
     parser.add_argument("--eval_mode", type=str, default="retain",
                         help="Comma-separated eval modes (default: retain)")
     parser.add_argument("--n_gpus", type=int, default=None,
                         help="Number of GPUs (default: auto-detect)")
-    args = parser.parse_args()
+    args, remaining = parser.parse_known_args()
 
-    base_name = args.run_name
+    # Parse remaining args as config overrides to forward to train.py
+    config_overrides = _parse_overrides(remaining)
+
+    # Warn about unknown override keys (not in DEFAULT_CONFIG)
+    unknown = set(config_overrides) - set(DEFAULT_CONFIG)
+    if unknown:
+        print(f"WARNING: Unknown config keys (not in DEFAULT_CONFIG): {unknown}")
+
+    base_name = args.run_name or _auto_run_name(config_overrides)
     seeds = list(range(1, args.n_seeds + 1))
     n_gpus = args.n_gpus or torch.cuda.device_count()
     print(f"Base run name: {base_name}")
+    if config_overrides:
+        print(f"Config overrides: {config_overrides}")
     print(f"Seeds: {seeds}")
     print(f"GPUs available: {n_gpus}")
 
     # ── Config validation ──
-    check_config(base_name)
-    save_base_config(base_name)
+    check_config(base_name, config_overrides)
+    save_base_config(base_name, config_overrides)
 
     # Write seed_runs.json for plot_seeds.py
     write_seed_runs_json(base_name, seeds)
@@ -354,7 +488,7 @@ def main():
             print(f"{'='*60}")
 
             train_tasks = [
-                (seed, lambda gpu_id, s=seed: run_train(base_name, s, gpu_id))
+                (seed, lambda gpu_id, s=seed: run_train(base_name, s, gpu_id, config_overrides))
                 for seed in train_seeds
             ]
             run_pool(train_tasks, n_gpus, task_type="train")
@@ -388,6 +522,29 @@ def main():
             print("\nAll seeds already evaluated, skipping evaluation phase")
     else:
         print("Skipping evaluation phase (--skip_eval)")
+
+    # ── Phase 2.5: Loss Evaluation ──
+    if not args.skip_loss_eval:
+        loss_eval_seeds = [s for s in seeds if not is_loss_eval_complete(base_name, s)]
+        skipped = len(seeds) - len(loss_eval_seeds)
+        if skipped:
+            print(f"\nSkipping {skipped} already loss-evaluated seeds: "
+                  f"{[s for s in seeds if s not in loss_eval_seeds]}")
+
+        if loss_eval_seeds:
+            print(f"\n{'='*60}")
+            print(f"=== Phase 2.5: Loss eval {len(loss_eval_seeds)} seeds ({loss_eval_seeds}) ===")
+            print(f"{'='*60}")
+
+            loss_eval_tasks = [
+                (seed, lambda gpu_id, s=seed: run_loss_eval(base_name, s, gpu_id))
+                for seed in loss_eval_seeds
+            ]
+            run_pool(loss_eval_tasks, n_gpus, task_type="loss_eval")
+        else:
+            print("\nAll seeds already loss-evaluated, skipping loss evaluation phase")
+    else:
+        print("Skipping loss evaluation phase (--skip_loss_eval)")
 
     # ── Phase 3: Aggregation (always re-run) ──
     print(f"\n{'='*60}")
