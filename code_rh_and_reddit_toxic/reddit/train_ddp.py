@@ -125,7 +125,9 @@ DEFAULT_CONFIG = dict(
     seed=3407,
     max_seq_length=2048,
     loss_averaging="per_example",
-    forget_on_classified_only=False,
+    forget_on_classified_only=True,
+
+    n_checkpoints=None,   # If set, save this many evenly-spaced checkpoints during training
 
     output_dir=None,
     run_name="gr_lora16_training-ablation_strict-forget_ddp",
@@ -162,6 +164,22 @@ def _parse_cli_overrides():
                 val = None
         overrides[key] = val
     return overrides
+
+
+def _save_gr_checkpoint_ddp(model, checkpoint_dir, args, tokenizer, config):
+    """Save GR adapter checkpoint from DDP model (rank 0 only)."""
+    checkpoint_dir = Path(checkpoint_dir)
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    unwrapped = model.module
+    if args.adapter_type == "mlp":
+        save_mlp_adapters(unwrapped, checkpoint_dir, args, tokenizer)
+    else:
+        unwrapped.save_pretrained(str(checkpoint_dir), selected_adapters=["retain"])
+        unwrapped.save_pretrained(str(checkpoint_dir), selected_adapters=["forget"])
+        tokenizer.save_pretrained(str(checkpoint_dir / "retain"))
+        tokenizer.save_pretrained(str(checkpoint_dir / "forget"))
+    with open(checkpoint_dir / "config.json", "w") as f:
+        json.dump(config, f, indent=2)
 
 
 def setup_distributed():
@@ -512,6 +530,13 @@ def main(**overrides):
     )
 
     total_steps = len(dataloader) * args.epochs
+
+    save_every_n_steps = None
+    if args.n_checkpoints and args.n_checkpoints > 0:
+        save_every_n_steps = max(1, total_steps // args.n_checkpoints)
+        if rank == 0:
+            print(f"Saving {args.n_checkpoints} checkpoints (every {save_every_n_steps} steps, total_steps={total_steps})")
+
     scheduler_retain = get_cosine_schedule_with_warmup(
         optimizer_retain, args.warmup_steps, total_steps
     )
@@ -705,6 +730,13 @@ def main(**overrides):
             epoch_steps += 1
             global_step += 1
 
+            if save_every_n_steps and global_step % save_every_n_steps == 0:
+                if rank == 0:
+                    ckpt_dir = output_dir / f"checkpoint_{global_step}"
+                    print(f"  Saving checkpoint at step {global_step} -> {ckpt_dir}")
+                    _save_gr_checkpoint_ddp(model, ckpt_dir, args, tokenizer, config)
+                dist.barrier()  # All ranks wait for rank 0 to finish saving
+
             avg_loss = epoch_loss / epoch_steps
             pbar.set_postfix(
                 loss=f"{total_loss:.4f}",
@@ -754,17 +786,8 @@ def main(**overrides):
 
     # === Save Adapters Separately (rank 0 only) ===
     if rank == 0:
-        print("\n=== Saving Adapters ===")
-        unwrapped_model = model.module
-        if args.adapter_type == "mlp":
-            save_mlp_adapters(unwrapped_model, output_dir, args, tokenizer)
-        else:
-            unwrapped_model.save_pretrained(str(output_dir), selected_adapters=["retain"])
-            unwrapped_model.save_pretrained(str(output_dir), selected_adapters=["forget"])
-            tokenizer.save_pretrained(str(output_dir / "retain"))
-            tokenizer.save_pretrained(str(output_dir / "forget"))
-            print(f"Retain adapter saved to: {output_dir / 'retain'}")
-            print(f"Forget adapter saved to: {output_dir / 'forget'}")
+        print("\n=== Saving Final Adapters ===")
+        _save_gr_checkpoint_ddp(model, output_dir, args, tokenizer, config)
 
         # Save training stats
         stats = {
@@ -794,6 +817,7 @@ def main(**overrides):
         print("\n=== Training Complete ===")
         wandb.finish()
 
+    dist.barrier()  # Wait for rank 0 to finish saving before destroying process group
     cleanup_distributed()
 
 

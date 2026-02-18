@@ -17,6 +17,7 @@ Usage:
 import argparse
 import json
 import math
+import re
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -43,6 +44,22 @@ CONFIG_COLORS = [
 ]
 
 CONFIG_MARKERS = ["o", "s", "D", "^", "v", "p", "H", "*", "X", "P"]
+
+
+BASE_EVAL_DIR = EXPERIMENTS_DIR / "_base_eval"
+
+
+def load_base_metrics():
+    """Load base model eval metrics (no adapters). Returns {} if not available."""
+    results_path = BASE_EVAL_DIR / "gr_reddit_eval_results.json"
+    if not results_path.exists():
+        return {}
+    try:
+        with open(results_path) as f:
+            data = json.load(f)
+        return data.get("modes", {}).get("base", {}).get("metrics", {})
+    except (json.JSONDecodeError, KeyError):
+        return {}
 
 
 def discover_experiments():
@@ -78,36 +95,31 @@ def load_seed_metrics(run_name, seed, mode="retain"):
     return {}
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Multi-seed aggregated scatter plot (Reddit)")
-    parser.add_argument("--output", default="seeds_plot.png", help="Output PNG path")
-    parser.add_argument("--mode", default="retain", help="Eval mode to plot (default: retain)")
-    parser.add_argument("--x_metric", default="model_graded_qa/accuracy",
-                        help="X-axis metric (default: model_graded_qa/accuracy)")
-    parser.add_argument("--y_metric", default="harassment_score/mean",
-                        help="Y-axis metric (default: harassment_score/mean)")
-    args = parser.parse_args()
-
-    experiments = discover_experiments()
-    if not experiments:
-        print(f"ERROR: No seed_runs.json found under {EXPERIMENTS_DIR}/*/. Run run_seeds.py first.")
-        return
-
-    print(f"Found {len(experiments)} experiment(s): {list(experiments.keys())}")
+def plot_mode(experiments, mode, output_path, x_metric, y_metric):
+    """Generate a scatter plot for a single eval mode."""
+    print(f"\n--- Plotting mode: {mode} -> {output_path} ---")
 
     fig, ax = plt.subplots(figsize=(8, 6))
 
-    for idx, (run_name, seeds) in enumerate(sorted(experiments.items())):
+    def _sort_key(item):
+        """Sort by adapter type, then by increasing learning rate."""
+        name = item[0]
+        m = re.search(r"lr([\d.e+-]+)", name)
+        lr = float(m.group(1)) if m else 0
+        adapter = "a" if "mlp" in name else "b"  # mlp first, then lora
+        return (adapter, lr)
+
+    for idx, (run_name, seeds) in enumerate(sorted(experiments.items(), key=_sort_key)):
         color = CONFIG_COLORS[idx % len(CONFIG_COLORS)]
         marker = CONFIG_MARKERS[idx % len(CONFIG_MARKERS)]
 
         xs, ys = [], []
         for seed in sorted(seeds):
-            metrics = load_seed_metrics(run_name, seed, args.mode)
-            x = metrics.get(args.x_metric)
-            y = metrics.get(args.y_metric)
+            metrics = load_seed_metrics(run_name, seed, mode)
+            x = metrics.get(x_metric)
+            y = metrics.get(y_metric)
             if x is None or y is None:
-                print(f"  Skipping {run_name}/seed{seed}: missing {args.x_metric} or {args.y_metric}")
+                print(f"  Skipping {run_name}/seed{seed}: missing {x_metric} or {y_metric}")
                 continue
             xs.append(x)
             ys.append(y)
@@ -149,17 +161,59 @@ def main():
               f"persuasiveness={mean_x:.4f}+/-{ci95_x:.4f}, "
               f"harassment={mean_y:.4f}+/-{ci95_y:.4f}")
 
+    # Plot base model as a reference point (no error bars)
+    base_metrics = load_base_metrics()
+    base_x = base_metrics.get(x_metric)
+    base_y = base_metrics.get(y_metric)
+    if base_x is not None and base_y is not None:
+        ax.plot(
+            base_x, base_y,
+            marker="*", color="black", markersize=14,
+            linestyle="none", zorder=4, label="base model",
+        )
+        print(f"  base model: persuasiveness={base_x:.4f}, harassment={base_y:.4f}")
+    else:
+        print("  Base model: no data (run eval_base.py first)")
+
     ax.set_xlabel("Persuasiveness (accuracy)")
     ax.set_ylabel("Harassment Score (mean)")
     ax.invert_yaxis()
-    ax.set_title(f"Multi-Seed Results ({args.mode} mode)\nMean +/- 95% CI")
+    ax.set_title(f"Multi-Seed Results ({mode} mode)\nMean +/- 95% CI")
     ax.grid(True, alpha=0.3)
     ax.legend(fontsize=8, loc="best")
 
     fig.tight_layout()
-    fig.savefig(args.output, dpi=300)
-    print(f"\nSaved plot to {args.output}")
+    fig.savefig(output_path, dpi=300)
+    print(f"  Saved plot to {output_path}")
     plt.close(fig)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Multi-seed aggregated scatter plot (Reddit)")
+    parser.add_argument("--output", default="seeds_plot.png", help="Output PNG path (mode name inserted before extension for multi-mode)")
+    parser.add_argument("--mode", default="retain,both", help="Comma-separated eval modes to plot (default: retain,both)")
+    parser.add_argument("--x_metric", default="model_graded_qa/accuracy",
+                        help="X-axis metric (default: model_graded_qa/accuracy)")
+    parser.add_argument("--y_metric", default="harassment_score/mean",
+                        help="Y-axis metric (default: harassment_score/mean)")
+    args = parser.parse_args()
+
+    experiments = discover_experiments()
+    if not experiments:
+        print(f"ERROR: No seed_runs.json found under {EXPERIMENTS_DIR}/*/. Run run_seeds.py first.")
+        return
+
+    print(f"Found {len(experiments)} experiment(s): {list(experiments.keys())}")
+
+    modes = [m.strip() for m in args.mode.split(",")]
+    output_base = Path(args.output)
+
+    for mode in modes:
+        if len(modes) == 1:
+            output_path = str(output_base)
+        else:
+            output_path = str(output_base.with_stem(f"{output_base.stem}_{mode}"))
+        plot_mode(experiments, mode, output_path, args.x_metric, args.y_metric)
 
 
 if __name__ == "__main__":

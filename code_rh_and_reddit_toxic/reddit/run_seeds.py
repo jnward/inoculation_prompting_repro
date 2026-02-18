@@ -52,25 +52,76 @@ EXPERIMENTS_DIR = SCRIPT_DIR / "experiments"
 SEED_SPECIFIC_KEYS = {"seed", "classifier_seed", "run_name", "output_dir"}
 
 
+# ── Override parsing ───────────────────────────────────────────────────
+
+
+def _coerce_value(val):
+    """Coerce a string value to int, float, bool, or None if possible."""
+    for cast in (int, float):
+        try:
+            return cast(val)
+        except ValueError:
+            continue
+    if val.lower() == "true":
+        return True
+    if val.lower() == "false":
+        return False
+    if val.lower() == "none":
+        return None
+    return val
+
+
+def _parse_overrides(argv):
+    """Parse --key=value or --key value args into a dict, coercing types.
+
+    Handles both `--key=value` and `--key value` forms.  Bare `--flag`
+    (not followed by a non-option value) is treated as `flag=True`.
+    """
+    overrides = {}
+    i = 0
+    while i < len(argv):
+        arg = argv[i]
+        if not arg.startswith("--"):
+            i += 1
+            continue
+        arg = arg[2:]  # strip --
+        if "=" in arg:
+            key, val = arg.split("=", 1)
+            overrides[key] = _coerce_value(val)
+        else:
+            key = arg
+            # Peek at next element for a value
+            if i + 1 < len(argv) and not argv[i + 1].startswith("--"):
+                overrides[key] = _coerce_value(argv[i + 1])
+                i += 1  # consume the value
+            else:
+                overrides[key] = True
+        i += 1
+    return overrides
+
+
 # ── Config validation helpers ──────────────────────────────────────────
 
 
-def _base_config():
-    """Return DEFAULT_CONFIG with per-seed keys stripped."""
-    return {k: v for k, v in DEFAULT_CONFIG.items() if k not in SEED_SPECIFIC_KEYS}
+def _base_config(overrides=None):
+    """Return DEFAULT_CONFIG (with overrides applied) minus per-seed keys."""
+    config = dict(DEFAULT_CONFIG)
+    if overrides:
+        config.update(overrides)
+    return {k: v for k, v in config.items() if k not in SEED_SPECIFIC_KEYS}
 
 
-def save_base_config(base_name):
+def save_base_config(base_name, overrides=None):
     """Save the current base config to experiments/{base_name}/base_config.json."""
     base_dir = EXPERIMENTS_DIR / base_name
     os.makedirs(base_dir, exist_ok=True)
-    config = _base_config()
+    config = _base_config(overrides)
     with open(base_dir / "base_config.json", "w") as f:
         json.dump(config, f, indent=2, sort_keys=True)
 
 
-def check_config(base_name):
-    """Compare current DEFAULT_CONFIG against saved base_config.json.
+def check_config(base_name, overrides=None):
+    """Compare current DEFAULT_CONFIG (with overrides) against saved base_config.json.
 
     Returns True if no saved config (first run) or configs match.
     Raises SystemExit with a diff if configs differ.
@@ -82,7 +133,7 @@ def check_config(base_name):
     with open(config_path) as f:
         saved = json.load(f)
 
-    current = _base_config()
+    current = _base_config(overrides)
 
     # Compare (use sorted JSON serialization for reliable comparison)
     if json.dumps(saved, sort_keys=True) == json.dumps(current, sort_keys=True, default=str):
@@ -170,7 +221,7 @@ def run_train(base_name, seed, n_gpus, extra_args=None):
     return result.returncode
 
 
-def run_eval(base_name, seed, gpu_id, eval_mode="retain"):
+def run_eval(base_name, seed, gpu_id, eval_mode="retain", eval_limit=None):
     """Spawn an eval subprocess on the given GPU. Returns the Popen object."""
     exp_dir = str(seed_dir(base_name, seed))
     port = 9000 + gpu_id  # unique port per GPU to avoid collisions
@@ -180,6 +231,8 @@ def run_eval(base_name, seed, gpu_id, eval_mode="retain"):
         f"--mode={eval_mode}",
         f"--port={port}",
     ]
+    if eval_limit is not None:
+        cmd.append(f"--limit={eval_limit}")
     env = os.environ.copy()
     env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
 
@@ -275,12 +328,13 @@ def aggregate_results(base_name, seeds):
     return summary
 
 
-def run_pool(tasks, n_gpus, task_type="eval", on_complete=None):
+def run_pool(tasks, n_gpus, task_type="eval", on_complete=None, on_failure=None):
     """Run tasks across a GPU pool.
 
     Args:
         tasks: list of (seed, fn) where fn(gpu_id) -> Popen
         on_complete: optional callback(proc) called immediately when a task succeeds
+        on_failure: optional callback(proc) called immediately when a task fails
     """
     tasks = list(tasks)
     active = {}  # gpu_id -> proc
@@ -299,6 +353,8 @@ def run_pool(tasks, n_gpus, task_type="eval", on_complete=None):
                         on_complete(proc)
                 else:
                     print(f"  [GPU {gpu_id}] {task_type} seed {proc._seed} FAILED (exit code {ret})")
+                    if on_failure:
+                        on_failure(proc)
                     # Print last 20 lines of the log for quick diagnosis
                     log_path = proc._log_file.name
                     try:
@@ -342,11 +398,20 @@ def main():
                         help="Comma-separated eval modes (default: retain)")
     parser.add_argument("--n_gpus", type=int, default=None,
                         help="Number of GPUs (default: auto-detect)")
+    parser.add_argument("--eval_limit", type=int, default=None,
+                        help="Limit number of eval samples (default: all)")
     args, extra_args = parser.parse_known_args()
 
-    # Extra args (e.g. --adapter_type=lora) are forwarded to train_ddp.py
-    if extra_args:
-        print(f"Train overrides: {extra_args}")
+    # Parse remaining args as config overrides to forward to train_ddp.py
+    config_overrides = _parse_overrides(extra_args)
+
+    # Warn about unknown override keys (not in DEFAULT_CONFIG)
+    unknown = set(config_overrides) - set(DEFAULT_CONFIG)
+    if unknown:
+        print(f"WARNING: Unknown config keys (not in DEFAULT_CONFIG): {unknown}")
+
+    if config_overrides:
+        print(f"Config overrides: {config_overrides}")
 
     base_name = args.run_name
     seeds = list(range(1, args.n_seeds + 1))
@@ -356,8 +421,8 @@ def main():
     print(f"GPUs available: {n_gpus}")
 
     # ── Config validation ──
-    check_config(base_name)
-    save_base_config(base_name)
+    check_config(base_name, config_overrides)
+    save_base_config(base_name, config_overrides)
 
     # Write seed_runs.json for plot_seeds.py
     write_seed_runs_json(base_name, seeds)
@@ -375,8 +440,10 @@ def main():
             print(f"=== Phase 1: Training {len(train_seeds)} seeds ({train_seeds}) [serial DDP] ===")
             print(f"{'='*60}")
 
+            # Convert config overrides to CLI args for train_ddp.py
+            override_args = [f"--{k}={v}" for k, v in config_overrides.items()]
             for seed in train_seeds:
-                run_train(base_name, seed, n_gpus, extra_args=extra_args)
+                run_train(base_name, seed, n_gpus, extra_args=override_args)
         else:
             print("\nAll seeds already trained, skipping training phase")
     else:
@@ -396,7 +463,7 @@ def main():
             print(f"{'='*60}")
 
             eval_tasks = [
-                (seed, lambda gpu_id, s=seed: run_eval(base_name, s, gpu_id, args.eval_mode))
+                (seed, lambda gpu_id, s=seed: run_eval(base_name, s, gpu_id, args.eval_mode, eval_limit=args.eval_limit))
                 for seed in eval_seeds
             ]
             run_pool(

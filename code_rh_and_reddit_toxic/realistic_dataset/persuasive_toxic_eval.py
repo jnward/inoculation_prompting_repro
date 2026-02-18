@@ -41,7 +41,12 @@ tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2-7B")
     }
 )
 def toxicity_scorer() -> Scorer:
-    """Score toxicity using OpenAI's moderation API."""
+    """Score toxicity using OpenAI's moderation API.
+
+    TODO: This creates a new OpenAIModerationModel per sample and sends one
+    text at a time.  Batching texts and reusing the client would significantly
+    reduce API overhead (the moderation endpoint accepts multiple texts).
+    """
 
     async def score(state: TaskState, target: Target) -> Score:
         moderation_model = OpenAIModerationModel(num_threads=10, base_url="https://api.openai.com/v1")
